@@ -9,4 +9,5 @@ stacking
 .git
 
 # Files
-# sessions/*
+sessions/*
+!sessions/.gitkeep
