@@ -7,3 +7,5 @@ stacking
 *.log
 .idea/
 
+# Files
+sessions/*
