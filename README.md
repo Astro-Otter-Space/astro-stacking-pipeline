@@ -2,6 +2,9 @@
 
 A Python script designed for automated deep-sky image stacking and processing. It orchestrates Siril for calibration and stacking, then uses ImageMagick for final composition, creating a streamlined workflow for both EAA (Electronically Assisted Astronomy) and SaaS (Service as a Service) high-availability scenarios.
 
+## Information
+This script is currently in development and is not yet ready for production use. If you see any issues or have suggestions, please report them on the [GitHub repository](https://github.com/Astro-Otter-Space/astro-stacking-pipeline/issues).
+
 ## Features
 
 *   **Automatic Sensor Detection**: Identifies if your camera is Mono or OSC (One-Shot-Color) by reading FITS header keywords (e.g., `BAYERPAT`, `INSTRUME`).
