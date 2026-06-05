@@ -1,0 +1,11 @@
+# Core dependencies for astronomical image processing
+astropy>=5.0
+numpy
+
+# Python bindings for ImageMagick (optional but recommended)
+# Note: ImageMagick must be installed on the system separately.
+# The 'wand' package provides a more robust Python interface.
+wand>=0.6.0
+
+# Modern path handling (included for very old Python versions)
+pathlib ; python_version < "3.4"
