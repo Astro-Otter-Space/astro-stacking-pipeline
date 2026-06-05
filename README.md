@@ -41,7 +41,7 @@ Before using this script, ensure the following software is installed on your sys
 1.  Clone this repository or download the script:
     ```bash
     git clone https://github.com/Astro-Otter-Space/astro-stacking-pipeline.git
-    cd automated_stacking_pipeline
+    cd astro-stacking-pipeline
     ```
 2.  Create and activate a virtual environment:
     ```bash
