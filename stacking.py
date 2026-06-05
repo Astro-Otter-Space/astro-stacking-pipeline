@@ -978,7 +978,7 @@ def run(args) -> bool:
     try:
         cleanup_session(current_session_dir)
     except Exception as e:
-        debug(f"Échec du nettoyage final : {e}")
+        debug(f"Final clean-up failed : {e}")
 
     if composite_success:
         final_image = current_session_dir / f"{file_prefix}_full.{format_requested}"
@@ -995,17 +995,17 @@ def run(args) -> bool:
                 if tiff_path.is_file(): 
                     tiff_path.unlink()
     else:
-        emit("error", data={"step": "composition_failed", "detail": "Échec de la composition finale"})
+        emit("error", data={"step": "composition_failed", "detail": "Final composition failed"})
 
     emit("done", data={"uuid": session_uuid, "output_format": format_requested, "file_prefix": file_prefix})
     return True
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pipeline de stacking Astro-Otter Engine")
-    parser.add_argument("uuid", help="UUID unique de la session de traitement")
+    parser = argparse.ArgumentParser(description="Stacking pipeline")
+    parser.add_argument("uuid", help="Unique session UUID/directory")
     parser.add_argument("--format", default="png", choices=["png", "jpg", "tiff", "webp"], help="Format d'encodage du fichier final généré")
     parser.add_argument("--dso", default="unknown", help="Nom de l'objet céleste ciblé (ex: ngc2359)")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Activer les logs de debug")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Display debug log")
 
     args = parser.parse_args()
     global VERBOSE
