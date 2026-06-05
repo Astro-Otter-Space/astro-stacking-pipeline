@@ -1,0 +1,9 @@
+# Python
+venv
+stacking
+
+# System
+.DS_Store
+*.log
+.idea/
+
