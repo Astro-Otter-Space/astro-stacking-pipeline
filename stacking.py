@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Script d'empilement Siril pour EAA & SaaS.
+Siril stacking script for EAA & SaaS.
 
-Génère et exécute des scripts Siril pour :
-- Détecter automatiquement le type de capteur (Mono vs Couleur) via le Header FITS.
-- Isoler et empiler les brutes par filtre (HA, SII, OIII, RED, CLEAR, etc.).
-- Nettoyer les espaces dans les noms de fichiers pour immuniser le parseur Siril.
-- Utiliser les commandes natives de Siril 1.2+ ('cd', 'convert -out=.', 'stack r_light rej').
-- Convertir proprement les conteneurs FIT en masters TIFF (via load/save).
-- Fusionner les canaux en une composite chromatique (SHO, HOO, RVB, Mono) via ImageMagick.
-- S'exécuter à 100% en ligne de commande (mode headless strict).
+Generates and runs Siril scripts for:
+- Automatically detect sensor type (Mono vs Color) via FITS Header.
+- Isolate and stack raws by filter (HA, SII, OIII, RED, CLEAR, etc.).
+- Clean spaces in filenames to immunize Siril parser.
+- Use native Siril 1.2+ commands ('cd', 'convert -out=.', 'stack r_light rej').
+- Properly convert FIT containers to master TIFFs (via load/save).
+- Merge channels into a chromatic composite (SHO, HOO, RGB, Mono) via ImageMagick.
+- Run 100% in command-line mode (strict headless).
 
 Usage :
-    python3 stacking_siril.py <uuid> --format=webp
+    python3 stacking.py <uuid> --format=webp --dso=m31 --verbose
 """
 
 import os
@@ -28,10 +28,10 @@ from datetime import datetime
 from astropy.io import fits
 import numpy as np
 
-# Répertoire racine
+# Root directory
 BASE_DIR = Path(__file__).resolve().parent
 
-# Filtres valides acceptés et reconnus par le système
+# Valid filters accepted and recognized by the system
 VALID_FILTERS = [
     'IR_CUT', 'UV_IR_CUT', 'UHC', 'CLS', 'BROADBAND', 'DUAL_NARROWBAND',
     'LRGB', 'LUMINANCE', 'RED', 'GREEN', 'BLUE', 'RGB', 'HA', 'H_BETA',
@@ -43,7 +43,7 @@ def debug(message: str):
         print(f"[DEBUG] {message}", flush=True)
 
 def emit(status: str, data: dict = None, params: dict = None):
-    """Émet un message JSON vers stderr pour l'IPC avec l'API Symfony."""
+    """Emit a JSON message to stderr for IPC with Symfony API."""
     import json
     payload = {"status": status}
     if data: payload["data"] = data
@@ -63,7 +63,7 @@ def get_fits_header(fits_path: Path) -> dict:
         return {}
 
 def is_color_camera(fits_path: Path) -> bool:
-    """Analyse l'en-tête FITS pour déterminer si le capteur est couleur (OSC)."""
+    """Analyze FITS header to determine if sensor is color (OSC)."""
     header = get_fits_header(fits_path)
     if not header:
         return False
@@ -81,7 +81,7 @@ def is_color_camera(fits_path: Path) -> bool:
 # DOF (DARKS, FLATS, BIAS)
 # --------------------------------------------------------------------------
 def ensure_2d_master(master_path: Path) -> Path | None:
-    """Assure que le master est au format géométrique FITS 2D direct (Mono ou CFA) pour Siril CLI."""
+    """Ensure the master is in the correct 2D FITS geometric format (Mono or CFA) for Siril CLI."""
     if not master_path.exists():
         return None
 
@@ -91,7 +91,7 @@ def ensure_2d_master(master_path: Path) -> Path | None:
         try:
             output_path.unlink()
         except Exception as e:
-            debug(f"Impossible de supprimer {output_path} : {e}")
+            debug(f"Unable to delete {output_path} : {e}")
             return None
 
     try:
@@ -102,9 +102,9 @@ def ensure_2d_master(master_path: Path) -> Path | None:
         # Si l'image a été lue ou sauvée par erreur en RGB (3D)
         if data.ndim == 3:
             data = np.mean(data, axis=-1)  # Fusion propre en intensité pure
-            header.add_comment('Master normalisé en structure 2D par Astro-Otter')
+            header.add_comment('Master normalized to 2D structure')
         elif data.ndim != 2:
-            debug(f"Structure d'image invalide pour la calibration : {data.ndim} dimensions")
+            debug(f"Invalid image structure for calibration: {data.ndim} dimensions")
             return None
 
         header['NAXIS'] = 2
@@ -114,13 +114,13 @@ def ensure_2d_master(master_path: Path) -> Path | None:
         fits.writeto(output_path, data, header, overwrite=True)
         return output_path
     except Exception as e:
-        debug(f"Échec de la normalisation FITS 2D pour {master_path.name} : {e}")
+        debug(f"Failed to normalize FITS 2D for {master_path.name} : {e}")
         return None
 
 def get_master_dark_path(session_dir: Path, light_files: list[Path]) -> str | None:
     """
-    Recherche un master dark adapté. Priorise un master_dark générique,
-    sinon cherche par correspondance de temps de pose (EXPTIME/EXPOSURE).
+    Look for an appropriate master dark. Prioritize a generic master_dark,
+    otherwise search by exposure time match (EXPTIME/EXPOSURE).
     """
     darks_dir = session_dir / "darks"
     if not darks_dir.is_dir():
@@ -144,7 +144,7 @@ def get_master_dark_path(session_dir: Path, light_files: list[Path]) -> str | No
                     exposure = float(exposure)
                     break
         except Exception as e:
-            debug(f"Impossible de lire l'exposition de {light.name}: {e}")
+            debug(f"Unable to read exposure from {light.name}: {e}")
             continue
 
     if exposure is None:
@@ -160,7 +160,7 @@ def get_master_dark_path(session_dir: Path, light_files: list[Path]) -> str | No
         for pattern in patterns:
             matches = list(darks_dir.glob(pattern))
             if matches:
-                # On prend le premier match trouvé
+                # Take the first match found
                 m2d = ensure_2d_master(matches[0])
                 return str(m2d.resolve()) if m2d else str(matches[0].resolve())
 
@@ -169,33 +169,33 @@ def get_master_dark_path(session_dir: Path, light_files: list[Path]) -> str | No
 
 def get_master_flat_path(session_dir: Path, filter_name: str) -> str | None:
     """
-    Recherche un master flat. Priorise un master_flat générique,
-    sinon cherche un fichier contenant le nom du filtre dans son nom.
-    Exclut les fichiers temporaires de gradient *_2d.fit.
+    Look for a master flat. Prioritize a generic master_flat,
+    otherwise search for a file containing the filter name in its name.
+    Exclude temporary gradient files *_2d.fit.
     """
     flats_dir = session_dir / "flats"
     if not flats_dir.is_dir():
         return None
 
-    # 1. Recherche d'un master flat générique direct
+    # 1. Search for a direct generic master flat
     for ext in ['.fit', '.fits']:
         master_file = flats_dir / f"master_flat{ext}"
         if master_file.exists():
             m2d = ensure_2d_master(master_file)
             return str(m2d.resolve()) if m2d else str(master_file.resolve())
 
-    # 2. Recherche par correspondance de nom de filtre
+    # 2. Search by filter name match
     for ext in ['.fit', '.fits']:
         filter_pattern = f"*{filter_name}*{ext}"
-        # On filtre les résultats pour ignorer les résidus _2d.fit
+        # Filter results to ignore residuals _2d.fit
         matches = [f for f in flats_dir.glob(filter_pattern) if not f.name.endswith(f"_2d{ext}")]
 
-        # Fallback au cas où le filtre est écrit différemment (ex: ha au lieu de HA)
+        ## Fallback in case filter is written differently (e.g., ha instead of HA)
         if not matches:
             matches = [f for f in flats_dir.glob(f"*{filter_name.lower()}*{ext}") if not f.name.endswith(f"_2d{ext}")]
 
         if matches:
-            # Si le fichier trouvé est une brute unitaire (ne contient pas 'master')
+            # If the found file is a single raw (doesn't contain 'master')
             if "master" not in matches[0].name.lower():
                 return str((flats_dir / f"master_flat_{filter_name}.fit").resolve())
 
@@ -207,8 +207,8 @@ def get_master_flat_path(session_dir: Path, filter_name: str) -> str | None:
 
 def get_master_bias_path(session_dir: Path) -> str | None:
     """
-    Recherche un master bias standard (offset) dans le sous-dossier dédié.
-    Exclut les fichiers temporaires de gradient *_2d.fit.
+    Look for a standard master bias (offset) in the dedicated subdirectory.
+    Exclude temporary gradient files *_2d.fit.
     """
     bias_dir = session_dir / "bias"
     if not bias_dir.is_dir():
@@ -220,11 +220,11 @@ def get_master_bias_path(session_dir: Path) -> str | None:
             m2d = ensure_2d_master(master_file)
             return str(m2d.resolve()) if m2d else str(master_file.resolve())
 
-    # Fallback : s'il y a des fichiers FITS unitaires mais pas de 'master_bias.fit'
+    # Fallback: if there are single FITS files but no 'master_bias.fit'
     for ext in ['.fit', '.fits']:
         all_fits = [f for f in bias_dir.glob(f"*{ext}") if not f.name.endswith(f"_2d{ext}")]
         if all_fits:
-            # Si le premier fichier trouvé n'a pas 'master' dans son nom, on planifie sa création
+            # If the first file found doesn't have 'master' in its name, schedule its creation
             if "master" not in all_fits[0].name.lower():
                 return str((bias_dir / "master_bias.fit").resolve())
 
@@ -241,9 +241,9 @@ def get_subsky_command(
     master_bias_path: str = None
 ) -> str:
     """
-    Adapte les paramètres subsky selon la qualité de calibration disponible.
-    Ajusté pour nettoyer le vignettage résiduel dans les coins en l'absence de Flat,
-    tout en préservant le centre de l'image (pas de halo sombre).
+    Adjust subsky parameters according to the available calibration quality.
+    Optimized to clean residual vignetting in corners in the absence of Flat,
+    while preserving the center of the image (no dark halo).
     """
 
     missing = []
@@ -280,8 +280,8 @@ def get_subsky_command(
 
 def get_color_calibration_command(is_color: bool) -> str:
     """
-    Génère la meilleure commande d'étalonnage des couleurs possible.
-    Si le PCC est possible et demandé, on l'utilise. Sinon, fallback sur un 'cc' local.
+    Generate the best possible color calibration command.
+    If PCC is possible and requested, use it. Otherwise, fallback to local 'cc'.
     """
     if not is_color:
         return ""
@@ -306,13 +306,13 @@ def get_color_calibration_command(is_color: bool) -> str:
 
 def get_rmgreen_command(is_color: bool) -> str:
     """
-    Génère la commande de suppression du bruit vert (SCNR).
-    Uniquement pertinent sur les capteurs couleur.
+    Generate the noise removal command for green (SCNR).
+    Only relevant on color sensors.
     """
     return "rmgreen" if is_color else ""
 
 # --------------------------------------------------------------------------
-# GÉNÉRATION DES SCRIPTS NATIFS SIRIL (.SSF)
+# GENERATE NATIVE SIRIL SCRIPTS (.SSF)
 # --------------------------------------------------------------------------
 def generate_siril_stack_script(
     filter_work_dir: Path,
@@ -323,7 +323,7 @@ def generate_siril_stack_script(
     master_flat_path: str = None,
     master_bias_path: str = None
 ) -> str:
-    """Génère les instructions de stacking natives .ssf pour Siril 1.2.0."""
+    """Generate native Siril 1.2.0 stacking instructions (.ssf)."""
     absolute_work_dir = filter_work_dir.resolve()
     debug(f'absolute_work_dir: {absolute_work_dir}')
     lines = [
@@ -333,11 +333,11 @@ def generate_siril_stack_script(
     ]
 
     # =========================================================================
-    # CAS A : IMAGE UNIQUE (Traitement unitaire recalé)
+    # CASE A: SINGLE IMAGE (Single image processing with alignment)
     # =========================================================================
     if num_files == 1:
-        debug(f"LIGNE 339: CAS A : IMAGE UNIQUE (Traitement unitaire recalé)")
-        lines.append('# Traitement unitaire avec recalage possible')
+        debug(f"LINE 339: CASE A: SINGLE IMAGE (Single image processing with alignment)")
+        lines.append('# Single image processing with potential alignment')
         lines.append('convert light')
 
         has_masters = any([master_dark_path, master_flat_path, master_bias_path])
@@ -351,7 +351,7 @@ def generate_siril_stack_script(
             if is_color: calibrate_parts.append('-cfa')
             lines.append(" ".join(calibrate_parts))
 
-        # Recalage de l'image unique pour assurer la cohérence géométrique
+        # Align single image to ensure geometric consistency
         current_file = "pp_light_00001.fit" if has_masters else "light_00001.fit"
         lines.append(f'register "{current_file}"')
         lines.append(f'load r_{current_file}')
@@ -366,15 +366,15 @@ def generate_siril_stack_script(
         return "\n".join(lines)
 
     # =========================================================================
-    # CAS B : SÉQUENCE STANDARD (Multi-images)
+    # CASE B: STANDARD SEQUENCE (Multiple images)
     # =========================================================================
-    # 1. Conversion brute monochrome (CFA)
+    # 1. Convert raw monochrome (CFA)
     debug(f"CAS B : SÉQUENCE STANDARD (Multi-images)")
     current_sequence = "light"
 
     lines.append(f'convert {current_sequence}')
 
-    # 2. Calibration de la séquence 'light'
+    # 2. Calibration of the 'light' sequence
     debug(f"master_dark_path: {master_dark_path}")
     debug(f"master_flat_path: {master_flat_path}")
     debug(f"master_bias_path: {master_bias_path}")
@@ -395,12 +395,12 @@ def generate_siril_stack_script(
         lines.append(" ".join(calibrate_parts))
         current_sequence = "pp_light"
 
-    # 3. Dématriçage de la séquence via la commande preprocess
+    # 3. De-mosaic the sequence via the preprocess command
     if is_color:
         lines.extend([f"preprocess {current_sequence} -debayer", ""])
         current_sequence = f"pp_{current_sequence}"
 
-    # 4. Alignement (register) et Empilement (stack)
+    # 4. Alignment (register) and Stacking (stack)
     clean_sequence = current_sequence.rstrip('_')
     lines.extend([
         f'register {clean_sequence}',
@@ -418,9 +418,8 @@ def generate_siril_stack_script(
 
 def generate_siril_script(session_dir: Path, filter_name: str, file_prefix: str) -> str:
     """
-    Génère le script de conversion FIT vers TIFF intermédiaire.
-    Utilise la commande native 'savetif' de Siril 1.2 pour éviter la création
-    de fichiers hybrides erronés comme '.tif.fit'.
+    Generate the intermediate FIT to TIFF conversion script.
+    Uses the native 'savetif' command from Siril 1.2 to avoid erroneous hybrid files like '.tif.fit'.
     """
     fit_path = (session_dir / f"{file_prefix}_{filter_name}.fit").as_posix()
     tif_path = (session_dir / f"{file_prefix}_{filter_name}").as_posix()
@@ -434,10 +433,10 @@ def generate_siril_script(session_dir: Path, filter_name: str, file_prefix: str)
     ])
 
 # --------------------------------------------------------------------------
-# EXÉCUTION DU MOTEUR CORE (SIRIL-CLI)
+# CORE ENGINE EXECUTION (SIRIL-CLI)
 # --------------------------------------------------------------------------
 def run_siril_command(session_dir: Path, script_content: str, script_name: str) -> bool:
-    """Exécute un script utilisateur Siril avec siril-cli."""
+    """Execute a user Siril script with siril-cli."""
     script_path = session_dir / script_name
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(script_content)
@@ -460,7 +459,7 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str) 
         process.wait()
         return process.returncode == 0
     except Exception as e:
-        debug(f"Erreur fatale d'exécution siril-cli : {e}")
+        debug(f"Fatal error running siril-cli: {e}")
         return False
     finally:
         if script_path.exists():
@@ -470,7 +469,7 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str) 
 # CHROMINANCE & COMPOSITION VIA IMAGEMAGICK
 # --------------------------------------------------------------------------
 # def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, file_prefix: str) -> bool:
-#     """Combine les fichiers TIFF normalisés et gère les palettes d'assemblage (LRVB / SHO / HOO / HOO+RGB)."""
+#     """Combine normalized TIFF files and handle assembly palettes (LRVB / SHO / HOO / HOO+RGB)."""
 #     output_file = session_dir / f"{file_prefix}_full.{output_format}"
 #
 #     # Canal unique (Mono ou extraction brute simple)
@@ -553,15 +552,15 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str) 
 #         return False
 
 def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, file_prefix: str) -> bool:
-    """Combine les fichiers TIFF normalisés et gère les palettes d'assemblage (LRVB / SHO / HOO / HOO+RGB)."""
+    """Combine normalized TIFF files and handle assembly palettes (LRVB / SHO / HOO / HOO+RGB)."""
     from PIL import Image
     output_file = session_dir / f"{file_prefix}_full.{output_format}"
 
-    # 1. Détermination de la géométrie de référence pour les zones noires (xc:black)
+    # 1. Determine reference geometry for black areas (xc:black)
     ref_path = next(iter(tif_files.values()))
     width, height = get_image_dimensions(ref_path)
 
-    # Canal unique (Mono ou extraction brute simple)
+    # Single channel (Mono or simple raw extraction)
     if len(tif_files) == 1:
         single_channel = list(tif_files.values())[0]
         cmd = ["convert", str(single_channel)]
@@ -572,19 +571,19 @@ def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, fi
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             return result.returncode == 0
         except Exception as e:
-            debug(f"Échec ImageMagick Canal Unique : {e}")
+            debug(f"ImageMagick Single Channel Failure: {e}")
             return False
 
-    # --- ÉTAPE 1 : DÉTERMINATION DU MODE D'ASSEMBLAGE ---
+    # --- STEP 1: DETERMINE ASSEMBLY MODE ---
     cmd = ["convert"]
 
-    # Vérification de la présence des blocs de filtres
+    # Check presence of filter blocks
     has_ha = "HA" in tif_files
     has_oiii = "OIII" in tif_files
     has_sii = "SII" in tif_files
     has_rgb = "RED" in tif_files and "GREEN" in tif_files and "BLUE" in tif_files
 
-    # CAS SPÉCIAL EXCLUSIF : SHO + RGB (Mixage avancé pour étoiles colorées)
+    # SPECIAL CASE ONLY: SHO + RGB (Advanced mixing for colored stars)
     if has_sii and has_ha and has_oiii and has_rgb:
         mix_channels = [
             (tif_files["SII"], tif_files["RED"]),
@@ -594,27 +593,27 @@ def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, fi
         for nb_file, rgb_file in mix_channels:
             cmd.extend(["(", str(nb_file), str(rgb_file), "-blend", "80x20", ")"])
 
-    # CAS STANDARDS (SHO, HOO pur, ou RVB classique)
+    # STANDARD CASES (SHO, HOO pure, or classic RGB)
     else:
-        # Assignation par défaut / RVB classique
+        # Default assignment / classic RGB
         r_channel = tif_files.get("RED", tif_files.get("HA", "xc:black"))
         g_channel = tif_files.get("GREEN", tif_files.get("OIII", "xc:black"))
         b_channel = tif_files.get("BLUE", tif_files.get("SII", "xc:black"))
 
-        # Mapping des palettes bandes étroites
+        # Narrowband palette mapping
         if has_sii and has_ha and has_oiii:
             r_channel, g_channel, b_channel = tif_files["SII"], tif_files["HA"], tif_files["OIII"]
         elif has_ha and has_oiii:
             r_channel, g_channel, b_channel = tif_files["HA"], tif_files["OIII"], tif_files["OIII"]
 
-        # Ajout des canaux à la commande avec correction de taille dynamique
+        # Add channels to command with dynamic size correction
         for channel in [r_channel, g_channel, b_channel]:
             if channel == "xc:black":
                 cmd.extend(["-size", f"{width}x{height}", "xc:black"])
             else:
                 cmd.append(str(channel))
 
-    # --- ÉTAPE 2 : FINALISATION ET EXÉCUTION ---
+    # --- STEP 2: FINALIZATION AND EXECUTION ---
     cmd.extend([
         "-despeckle",
         "-median", "1",
@@ -627,44 +626,45 @@ def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, fi
         cmd.extend(["-quality", "95"])
     cmd.append(str(output_file))
 
-    debug(f"Exécution de la synthèse chromatique ImageMagick : {' '.join(cmd)}")
+    debug(f"Running ImageMagick chrominance synthesis: {' '.join(cmd)}")
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0:
-            debug(f"Erreur ImageMagick STDERR : {result.stderr}")
+            debug(f"ImageMagick STDERR Error: {result.stderr}")
         return result.returncode == 0
     except Exception as e:
-        debug(f"Échec de l'assemblage composite ImageMagick : {e}")
+        debug(f"ImageMagick composite assembly failure: {e}")
         return False
 
 def get_image_dimensions(ref_path: Path) -> tuple:
-    """Récupère les dimensions réelles du master FITS pour ImageMagick."""
+    """Get real dimensions of the master FITS for ImageMagick."""
     try:
         from PIL import Image
         with Image.open(ref_path) as img:
             return img.size # Retourne (width, height)
     except Exception:
         # Fallback de secours si PIL échoue
-        debug(f"Alerte : Impossible de lire les dimensions de {ref_path}, fallback 2048x2048")
+        debug(f"Warning: Could not read dimensions of {ref_path}, fallback 2048x2048")
         return (2048, 2048)
 
 def correct_image_orientation(image_path: Path):
-    """Retourne verticalement l'image finale pour compenser le repère FITS (origine en bas à gauche)."""
+    """Vertically flip the final image to compensate for FITS coordinate system (origin at bottom-left)."""
     try:
         subprocess.run(["convert", str(image_path), "-flip", str(image_path)], check=True)
     except Exception as e:
-        debug(f"Échec de la correction d'orientation spatiale : {e}")
+        debug(f"Orientation correction failure: {e}")
+
 # --------------------------------------------------------------------------
-# ALIGNEMENT DES IMAGES AVEC SIRIL-CLI
+# IMAGE ALIGNMENT WITH SIRIL-CLI
 # --------------------------------------------------------------------------
 def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Path = None) -> bool:
     """
-    Aligne proprement les images sur une référence via un script .ssf unique.
+    Properly align images to a reference via a single .ssf script.
     """
     if not images_to_align or not ref_image:
         return False
 
-    # On prépare le fichier script qui sera exécuté en une seule instance Siril
+    # Prepare the script file to be executed in a single Siril instance
     script_path = session_dir / "inter_filter_align.ssf"
 
     with open(script_path, "w", encoding="utf-8") as f:
@@ -688,16 +688,16 @@ def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Pa
     return result.returncode == 0
 
 # --------------------------------------------------------------------------
-# ALIGNEMENT DES IMAGES AVEC ASTROALIGN (NON APPELÉE)
+# IMAGE ALIGNMENT WITH ASTROALIGN (NOT CALLED)
 # --------------------------------------------------------------------------
 def align_images_with_astroalign(session_dir, filter_name, reference_path):
-    """Aligne toutes les images d'un filtre sur une référence avec Astroalign.
+    """Align all images of a filter to a reference with Astroalign.
     """
     try:
         import astroalign as aa
         from astropy.nddata import CCDData
     except ImportError:
-        debug("Astroalign non installé. Utilisez 'pip install astroalign' pour l'activer.")
+        debug("Astroalign not installed. Use 'pip install astroalign' to enable it.")
         return False
 
     reference = CCDData.read(reference_path, unit='adu')
@@ -709,16 +709,16 @@ def align_images_with_astroalign(session_dir, filter_name, reference_path):
             aligned, _ = aa.register(image, reference)
             aligned.write(img_path.with_name(f"{img_path.stem}_aligned{img_path.suffix}"), overwrite=True)
         except Exception as e:
-            debug(f"Échec de l'alignement Astroalign pour {img_path}: {e}")
+            debug(f"Astroalign alignment failure for {img_path}: {e}")
             return False
-    debug(f"Alignement Astroalign terminé pour {filter_name}")
+    debug(f"Astroalign alignment completed for {filter_name}")
     return True
 
 # --------------------------------------------------------------------------
-# COORDINATION ET RUNNER MAIN
+# COORDINATION AND MAIN RUNNER
 # --------------------------------------------------------------------------
 def cleanup_session(session_dir: Path):
-    """Nettoie tous les fichiers temporaires, y compris les masters convertis et les résidus de gradient."""
+    """Clean all temporary files, including converted masters and gradient residuals."""
     temp_patterns = [
         "*.tmp", "*.log", "*.pid", "*.lock", "*.txt",
         "work_*/",           # Répertoires de travail
@@ -752,12 +752,12 @@ def cleanup_session(session_dir: Path):
                 try:
                     if match.is_file():
                         match.unlink()
-                        debug(f"Fichier temporaire supprimé : {match}")
+                        debug(f"Temporary file deleted: {match}")
                     elif match.is_dir():
                         shutil.rmtree(match)
-                        debug(f"Répertoire temporaire supprimé : {match}")
+                        debug(f"Temporary directory deleted: {match}")
                 except Exception as e:
-                    debug(f"Échec de suppression de {match} : {e}")
+                    debug(f"Failed to delete {match}: {e}")
 
 def run(args) -> bool:
     session_uuid = args.uuid
@@ -775,20 +775,20 @@ def run(args) -> bool:
     cleanup_session(current_session_dir)
 
     if not lights_dir.is_dir():
-        emit("error", params={"detail": "Dossier lights introuvable"})
+        emit("error", params={"detail": "Lights directory not found"})
         return False
 
-    # ✅ Étape 1 : Démarrage du traitement
-    emit("progress", data={"step": "start", "message": f"Traitement démarré pour {dso_name}"})
-    debug(f"Analyse des brutes pour {dso_name.upper()} | Session: {current_session_dir.name}")
+    # 1. Sort and index files by detected filter
+    emit("progress", data={"step": "start", "message": f"Processing started for {dso_name}"})
+    debug(f"Analyzing raws for {dso_name.upper()} | Session: {current_session_dir.name}")
 
-    # 1. Tri et indexation des fichiers par filtre détecté
+    # 1. Sort and index files by detected filter
     files_by_filter = {}
     for f in lights_dir.iterdir():
         if f.is_file() and f.suffix.lower() in ['.fits', '.fit', '.fts']:
             matched_filter = None
 
-            # Étape 1 : Essayer de lire le filtre à partir de l'en-tête FITS
+            # Step 1: Try to read filter from FITS header
             try:
                 with fits.open(f, mode='readonly', ignore_missing_end=True) as hdul:
                     header = hdul[0].header
@@ -820,9 +820,9 @@ def run(args) -> bool:
                     if filter_keyword in filter_map:
                         matched_filter = filter_map[filter_keyword]
             except Exception as e:
-                debug(f"Échec de lecture de l'en-tête FITS: {f.name} -> {matched_filter} (original: {header.get('FILTER', 'N/A')}) / {e}")
+                debug(f"Failed to read FITS header: {f.name} -> {matched_filter} (original: {header.get('FILTER', 'N/A')}) / {e}")
 
-            # Étape 2 : Si l'étape 1 a échoué ou n'a pas trouvé de filtre valide, essayer avec le nom du fichier
+            # Step 2: If step 1 failed or no valid filter found, try with filename
             if matched_filter is None:
                 filename_upper = f.name.upper()
                 for v_filter in VALID_FILTERS:
@@ -830,10 +830,10 @@ def run(args) -> bool:
                         matched_filter = v_filter
                         break
 
-            # Étape 3 : Si les deux étapes précédentes ont échoué, utiliser CLEAR
+            # Step 3: If both previous steps failed, default to CLEAR
             if matched_filter is None:
                 matched_filter = "CLEAR"
-                debug(f"Non identifié, classé comme CLEAR: {f.name}")
+                debug(f"Not identified, classified as CLEAR: {f.name}")
 
             if matched_filter not in files_by_filter:
                 files_by_filter[matched_filter] = []
