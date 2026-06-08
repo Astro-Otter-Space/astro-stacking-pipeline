@@ -905,8 +905,9 @@ def run(args) -> bool:
 
         num_files = 0
         for src_file in sorted(files_by_filter[current_filter]):
-            clean_name = src_file.name.replace(" ", "_")
-            dst_file = filter_work_dir / clean_name
+#             clean_name = src_file.name.replace(" ", "_")
+            dst_name = f"light_{num_files:05d}{src_file.suffix.lower()}"
+            dst_file = filter_work_dir / dst_name
             if not dst_file.exists():
                 try:
                     dst_file.symlink_to(src_file.resolve())
