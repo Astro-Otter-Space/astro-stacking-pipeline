@@ -458,20 +458,21 @@ def generate_siril_script(session_dir: Path, filter_name: str, file_prefix: str)
 # --------------------------------------------------------------------------
 # CORE ENGINE EXECUTION (SIRIL-CLI)
 # --------------------------------------------------------------------------
-def run_siril_command(session_dir: Path, script_content: str, script_name: str) -> bool:
+def run_siril_command(session_dir: Path, script_content: str, script_name: str, work_dir: Path = None) -> bool:
     """Execute a user Siril script with siril-cli."""
     script_path = session_dir / script_name
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(script_content)
 
     cmd = ["siril-cli", "-s", str(script_path)]
+    effective_cwd = str(work_dir) if work_dir else str(session_dir)
 
     try:
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            cwd=str(session_dir),
+            cwd=effective_cwd,
             text=True
         )
 
@@ -924,7 +925,12 @@ def run(args) -> bool:
             master_flat_path,
             master_bias_path
         )
-        success = run_siril_command(current_session_dir, stack_script, f"stack_{current_filter}.ssf")
+        success = run_siril_command(
+            current_session_dir,
+            stack_script,
+            f"stack_{current_filter}.ssf",
+            work_dir=filter_work_dir
+        )
 
         if filter_work_dir.is_dir():
             shutil.rmtree(filter_work_dir)
