@@ -1,6 +1,7 @@
 # Core dependencies for astronomical image processing
 astropy>=5.0
 numpy
+Pillow
 
 # Python bindings for ImageMagick (optional but recommended)
 # Note: ImageMagick must be installed on the system separately.

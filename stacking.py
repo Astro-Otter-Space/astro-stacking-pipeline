@@ -314,6 +314,9 @@ def get_rmgreen_command(is_color: bool) -> str:
 # --------------------------------------------------------------------------
 # GENERATE NATIVE SIRIL SCRIPTS (.SSF)
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# GENERATE NATIVE SIRIL SCRIPTS (.SSF)
+# --------------------------------------------------------------------------
 def generate_siril_stack_script(
     filter_work_dir: Path,
     filter_name: str,
@@ -332,54 +335,70 @@ def generate_siril_stack_script(
         ""
     ]
 
+    has_masters = any([master_dark_path, master_flat_path, master_bias_path])
+
     # =========================================================================
-    # CASE A: SINGLE IMAGE (Single image processing with alignment)
+    # CASE A: SINGLE IMAGE
     # =========================================================================
     if num_files == 1:
-        debug(f"LINE 339: CASE A: SINGLE IMAGE (Single image processing with alignment)")
-        lines.append('# Single image processing with potential alignment')
+        debug("CASE A: SINGLE IMAGE")
+        lines.append('# Single image — convert, calibrate, register, post-process')
         lines.append('convert light')
 
-        has_masters = any([master_dark_path, master_flat_path, master_bias_path])
         if has_masters:
             calibrate_parts = ["calibrate light"]
-            if master_bias_path: calibrate_parts.append(f"-bias={Path(master_bias_path).as_posix()}")
+            if master_bias_path:
+                calibrate_parts.append(f"-bias={Path(master_bias_path).as_posix()}")
             if master_dark_path:
                 clean_dark = master_dark_path.replace('-dark=', '').replace('"', '')
                 calibrate_parts.append(f'-dark={clean_dark}')
-            if master_flat_path: calibrate_parts.append(f"-flat={Path(master_flat_path).as_posix()}")
-            if is_color: calibrate_parts.append('-cfa')
+            if master_flat_path:
+                calibrate_parts.append(f"-flat={Path(master_flat_path).as_posix()}")
+            if is_color:
+                calibrate_parts.append('-cfa')
             lines.append(" ".join(calibrate_parts))
 
         # Align single image to ensure geometric consistency
-        current_file = "pp_light_00001.fit" if has_masters else "light_00001.fit"
-        lines.append(f'register "{current_file}"')
-        lines.append(f'load r_{current_file}')
-        
+        current_sequence = "pp_light_" if has_masters else "light"
+        lines.append(f'register {current_sequence}')
+        reg_base = current_sequence.rstrip('_')
+        reg_frame = f"r_{reg_base}_00001.fit"
+        lines.append(f'load {reg_frame}')
+
         if is_color:
-            lines.extend(['debayer', 'save pp_light_00001_debayer.fit', 'load pp_light_00001_debayer.fit'])
+            debayer_out = f"r_{reg_base}_00001_debayer.fit"
+            lines.extend([
+                'debayer',
+                f'save {debayer_out}',
+                f'load {debayer_out}'
+            ])
 
         subsky_cmd = get_subsky_command(master_dark_path, master_flat_path, master_bias_path)
-        if subsky_cmd: lines.append(subsky_cmd)
+        if subsky_cmd:
+            lines.append(subsky_cmd)
 
-        lines.extend(["autostretch", f'save "../stacked_{filter_name}.fit"', "close", "exit"])
+        lines.extend([
+            "autostretch",
+            f'save "../stacked_{filter_name}.fit"',
+            "close",
+            "exit"
+        ])
         return "\n".join(lines)
 
     # =========================================================================
     # CASE B: STANDARD SEQUENCE (Multiple images)
     # =========================================================================
     # 1. Convert raw monochrome (CFA)
-    debug(f"CAS B : SÉQUENCE STANDARD (Multi-images)")
-    current_sequence = "light"
-
-    lines.append(f'convert {current_sequence}')
-
-    # 2. Calibration of the 'light' sequence
+    debug("CASE B: STANDARD SEQUENCE (Multi-images)")
     debug(f"master_dark_path: {master_dark_path}")
     debug(f"master_flat_path: {master_flat_path}")
     debug(f"master_bias_path: {master_bias_path}")
-    has_masters = any([master_dark_path, master_flat_path, master_bias_path])
-    debug(f"Any: {has_masters}")
+    debug(f"Any master: {has_masters}")
+
+    lines.append('convert light')
+    current_sequence = "light"
+
+    # 2. Calibration of the 'light' sequence
     if has_masters:
         calibrate_parts = ["calibrate light"]
         if master_bias_path:
@@ -393,19 +412,23 @@ def generate_siril_stack_script(
         if is_color:
             calibrate_parts.extend(['-cfa', '-equalize_cfa'])
         lines.append(" ".join(calibrate_parts))
-        current_sequence = "pp_light"
+        current_sequence = "pp_light_"
 
     # 3. De-mosaic the sequence via the preprocess command
     if is_color:
-        lines.extend([f"preprocess {current_sequence} -debayer", ""])
-        current_sequence = f"pp_{current_sequence}"
+        debayer_input = current_sequence.rstrip('_')
+        lines.extend([f"preprocess {debayer_input} -debayer", ""])
+        current_sequence = f"pp_{debayer_input}_"
 
-    # 4. Alignment (register) and Stacking (stack)
-    clean_sequence = current_sequence.rstrip('_')
+    # 4. Register
+    lines.append(f'register {current_sequence}')
+    reg_base = current_sequence.rstrip('_')
+    stacked_seq = f"r_{reg_base}_"   # "r_light_", "r_pp_light_", "r_pp_pp_light_"
+
+    # 5. Stack + post-process
     lines.extend([
-        f'register {clean_sequence}',
-        f'stack r_{clean_sequence} rej winsorized 3 3 -norm=add -weight_from_noise',
-        f'load r_{clean_sequence}_stacked.fit',
+        f'stack {stacked_seq} rej winsorized 3 3 -norm=add -weight_from_noise',
+        f'load {stacked_seq}stacked.fit',
         "",
         get_subsky_command(master_dark_path, master_flat_path, master_bias_path),
         get_rmgreen_command(is_color),
