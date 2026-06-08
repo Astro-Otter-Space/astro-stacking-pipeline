@@ -336,7 +336,6 @@ def generate_siril_stack_script(
     ]
 
     has_masters = any([master_dark_path, master_flat_path, master_bias_path])
-
     # =========================================================================
     # CASE A: SINGLE IMAGE
     # =========================================================================
@@ -466,7 +465,7 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
 
     cmd = ["siril-cli", "-s", str(script_path)]
     effective_cwd = str(work_dir) if work_dir else str(session_dir)
-
+    debug(f"Check effective_cwd: {effective_cwd}")
     try:
         process = subprocess.Popen(
             cmd,
@@ -905,7 +904,7 @@ def run(args) -> bool:
         filter_work_dir.mkdir(parents=True, exist_ok=True)
 
         num_files = 0
-        for src_file in files_by_filter[current_filter]:
+        for src_file in sorted(files_by_filter[current_filter]):
             clean_name = src_file.name.replace(" ", "_")
             dst_file = filter_work_dir / clean_name
             if not dst_file.exists():
