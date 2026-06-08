@@ -768,7 +768,7 @@ def run(args) -> bool:
     format_requested = args.format.lower()
     dso_name = re.sub(r'[^a-zA-Z0-9_-]', '', args.dso.lower().replace(" ", ""))
 
-    # Génération du timestamp
+    # Generate timestamp
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     file_prefix = f"{dso_name}_{timestamp}"
 
@@ -782,7 +782,6 @@ def run(args) -> bool:
     emit("progress", data={"step": "start", "message": f"Processing started for {dso_name}"})
     debug(f"Analyzing raws for {dso_name.upper()} | Session: {current_session_dir.name}")
 
-    # 1. Sort and index files by detected filter
     files_by_filter = {}
     for f in lights_dir.iterdir():
         if f.is_file() and f.suffix.lower() in ['.fits', '.fit', '.fts']:
@@ -841,7 +840,7 @@ def run(args) -> bool:
 
     detected_filters = list(files_by_filter.keys())
     if not detected_filters:
-        emit("error", params={"detail": "Aucun fichier FITS valide trouvé"})
+        emit("error", params={"detail": "No valid FITS files found"})
         return False
 
     PRIORITY = {
@@ -852,16 +851,16 @@ def run(args) -> bool:
     detected_filters = sorted(detected_filters, key=lambda f: PRIORITY.get(f, 99))
     emit("progress", data={"step": "filters_detected", "filters": detected_filters})
 
-    # 2. Diagnostic du type de capteur sur la première brute disponible
+    # 2. Sensor type diagnostic on the first available raw
     first_filter_key = detected_filters[0]
     first_fits_file = files_by_filter[first_filter_key][0]
     camera_is_color = is_color_camera(first_fits_file)
     emit("progress", data={"step": "sensor_type", "type": "color" if camera_is_color else "mono"})
 
-    # Dictionnaire de stockage des masters FITS générés pour l'alignement croisé final
+    # Dictionary for storing generated master FITS for final cross-alignment
     master_files_map = {}
 
-    # 3. Traitement individualisé et empilement des canaux dans Siril
+    # 3. Individual processing and stacking of channels in Siril
     for current_filter in detected_filters:
         emit("progress", data={"step": "stacking_started", "filter": current_filter})
 
@@ -892,7 +891,7 @@ def run(args) -> bool:
                     shutil.copy(src_file, dst_file)
             num_files += 1
 
-        # Génération et exécution du script de stacking
+        # Generate and execute stacking script
         stack_script = generate_siril_stack_script(
             filter_work_dir,
             current_filter,
@@ -922,12 +921,12 @@ def run(args) -> bool:
             siril_default_fit.rename(custom_fit_name)
             master_files_map[current_filter] = custom_fit_name
         else:
-            # Sécurité : Si Siril l'a nommé différemment (ex: sans préfixe ou déjà avec le nom custom)
+            # Safety: If Siril named it differently (e.g., without prefix or already with custom name)
             fallback_fit = current_session_dir / f"{file_prefix}_{current_filter}.fit"
             if fallback_fit.is_file():
                 master_files_map[current_filter] = fallback_fit
             else:
-                # Si le fichier est resté dans le sous-dossier de travail
+                # If the file remained in the work subdirectory
                 work_fit = current_session_dir / f"work_{current_filter}" / f"stacked_{current_filter}.fit"
                 if work_fit.is_file():
                     shutil.move(work_fit, custom_fit_name)
@@ -936,12 +935,12 @@ def run(args) -> bool:
         if filter_work_dir.is_dir():
             shutil.rmtree(filter_work_dir)
 
-    # 4. Étape cruciale : Alignement croisé global
+    # 4. Crucial step: Global cross-filter alignment
     if len(master_files_map) > 1:
         emit("progress", data={"step": "inter_filter_alignment_started", "message": "Recalage géométrique global..."})
         ref_candidate = master_files_map.get('HA') or list(master_files_map.values())[0]
 
-        # On définit une liste des fichiers à aligner
+        # Define list of files to align
         files_to_align = [f for f in master_files_map.values() if f != ref_candidate]
 
         if align_channels(current_session_dir, files_to_align, ref_image=ref_candidate):
@@ -950,16 +949,16 @@ def run(args) -> bool:
                 if aligned.exists():
                     master_files_map[filter_k] = aligned
         else:
-            emit("warning", data={"step": "inter_filter_alignment_failed", "message": "Échec, utilisation des brutes"})
+            emit("warning", data={"step": "inter_filter_alignment_failed", "message": "Failed, using raws"})
 
-    # 5. Extraction finale des conteneurs FITS en images TIFF linéaires pour chaque canal validé
+     # 5. Final extraction of FITS containers to linear TIFF images for each validated channel
     for current_filter, final_fit_path in master_files_map.items():
-        debug(f"Extraction TIFF du master linéaire finalisé : {current_filter}")
-        # On passe temporairement par l'arborescence finale pour générer le .ssf de conversion
+        debug(f"Finalized linear master TIFF extraction : {current_filter}")
+        # Temporarily go through the final tree to generate conversion .ssf
         conv_script = generate_siril_script(current_session_dir, current_filter, file_prefix)
         run_siril_command(current_session_dir, conv_script, f"conv_{current_filter}.ssf")
 
-    # 6. Cartographie des fichiers TIFF générés
+    # 6. Mapping of generated TIFF files
     tif_mapped_files = {}
     for current_filter in detected_filters:
         target_tiff = current_session_dir / f"{file_prefix}_{current_filter}.tif"
@@ -967,11 +966,11 @@ def run(args) -> bool:
             tif_mapped_files[current_filter] = target_tiff
 
     if not tif_mapped_files:
-        debug("Échec critique de la collecte des matrices intermédiaires TIFF.")
+        debug("Critical failure collecting intermediate TIFF matrices.")
         emit("done", data={"uuid": session_uuid, "output_format": format_requested})
         return False
 
-    # 7. Composition finale via ImageMagick
+    # 7. Final composition via ImageMagick
     emit("progress", data={"step": "composition_started", "format": format_requested})
     composite_success = compose_rgb_image(current_session_dir, tif_mapped_files, format_requested, file_prefix)
     
@@ -1003,8 +1002,8 @@ def run(args) -> bool:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stacking pipeline")
     parser.add_argument("uuid", help="Unique session UUID/directory")
-    parser.add_argument("--format", default="png", choices=["png", "jpg", "tiff", "webp"], help="Format d'encodage du fichier final généré")
-    parser.add_argument("--dso", default="unknown", help="Nom de l'objet céleste ciblé (ex: ngc2359)")
+    parser.add_argument("--format", default="png", choices=["png", "jpg", "tiff", "webp"], help="Final file encoding format")
+    parser.add_argument("--dso", default="unknown", help="Target celestial object name (e.g., ngc2359, m42)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Display debug log")
 
     args = parser.parse_args()
