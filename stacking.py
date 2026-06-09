@@ -26,6 +26,7 @@ import json
 from pathlib import Path
 from datetime import datetime
 from astropy.io import fits
+from PIL import Image
 import numpy as np
 
 # Root directory
@@ -59,7 +60,7 @@ def get_fits_header(fits_path: Path) -> dict:
         with fits.open(fits_path, mode='readonly', ignore_missing_end=True) as hdul:
             return dict(hdul[0].header)
     except Exception as e:
-        logger.error(f"Failed to read FITS header from {fits_path}: {e}")
+        debug(f"Failed to read FITS header from {fits_path}: {e}")
         return {}
 
 def is_color_camera(fits_path: Path) -> bool:
@@ -311,9 +312,15 @@ def get_rmgreen_command(is_color: bool) -> str:
     """
     return "rmgreen" if is_color else ""
 
-# --------------------------------------------------------------------------
-# GENERATE NATIVE SIRIL SCRIPTS (.SSF)
-# --------------------------------------------------------------------------
+def _seq_detect_block(seq_prefix: str) -> list:
+    """Génère un bloc de détection de séquence Siril."""
+    return [
+        f'set seq_name "{seq_prefix}"',
+        f'if [ -f "{seq_prefix}_.seq" ]; then',
+        f'    set seq_name "{seq_prefix}_"',
+        'endif',
+        'load $seq_name'
+    ]
 # --------------------------------------------------------------------------
 # GENERATE NATIVE SIRIL SCRIPTS (.SSF)
 # --------------------------------------------------------------------------
@@ -326,116 +333,53 @@ def generate_siril_stack_script(
     master_flat_path: str = None,
     master_bias_path: str = None
 ) -> str:
-    """Generate native Siril 1.2.0 stacking instructions (.ssf)."""
-    absolute_work_dir = filter_work_dir.resolve()
-    debug(f'absolute_work_dir: {absolute_work_dir}')
+    """
+    Génère le script .ssf pour Siril.
+    num_files: utilisé pour valider qu'on a au moins 2 images pour le stack.
+    """
+    abs_work_dir = filter_work_dir.resolve().as_posix()
+
     lines = [
         "requires 1.2.0",
-        f'cd "{absolute_work_dir.as_posix()}"',
-        ""
+        f'cd "{abs_work_dir}"',
+        'convert light -out=.',
     ]
 
-    has_masters = any([master_dark_path, master_flat_path, master_bias_path])
-    # =========================================================================
-    # CASE A: SINGLE IMAGE
-    # =========================================================================
-    if num_files == 1:
-        debug("CASE A: SINGLE IMAGE")
-        lines.append('# Single image — convert, calibrate, register, post-process')
-        lines.append('convert light')
+    # 1. Calibration
+    seq = "light"
+    if any([master_dark_path, master_flat_path, master_bias_path]):
+        cal_cmd = [f"calibrate {seq}"]
+        if master_bias_path: cal_cmd.append(f"-bias={Path(master_bias_path).as_posix()}")
+        if master_dark_path: cal_cmd.append(f"-dark={Path(master_dark_path).as_posix()}")
+        if master_flat_path: cal_cmd.append(f"-flat={Path(master_flat_path).as_posix()}")
+        if is_color: cal_cmd.extend(['-cfa', '-equalize_cfa'])
+        lines.append(" ".join(cal_cmd))
+        seq = "pp_light"
 
-        if has_masters:
-            calibrate_parts = ["calibrate light"]
-            if master_bias_path:
-                calibrate_parts.append(f"-bias={Path(master_bias_path).as_posix()}")
-            if master_dark_path:
-                clean_dark = master_dark_path.replace('-dark=', '').replace('"', '')
-                calibrate_parts.append(f'-dark={clean_dark}')
-            if master_flat_path:
-                calibrate_parts.append(f"-flat={Path(master_flat_path).as_posix()}")
-            if is_color:
-                calibrate_parts.append('-cfa')
-            lines.append(" ".join(calibrate_parts))
-
-        # Align single image to ensure geometric consistency
-        current_sequence = "pp_light_" if has_masters else "light"
-        lines.append(f'register {current_sequence}')
-        reg_base = current_sequence.rstrip('_')
-        reg_frame = f"r_{reg_base}_00001.fit"
-        lines.append(f'load {reg_frame}')
-
-        if is_color:
-            debayer_out = f"r_{reg_base}_00001_debayer.fit"
-            lines.extend([
-                'debayer',
-                f'save {debayer_out}',
-                f'load {debayer_out}'
-            ])
-
-        subsky_cmd = get_subsky_command(master_dark_path, master_flat_path, master_bias_path)
-        if subsky_cmd:
-            lines.append(subsky_cmd)
-
-        lines.extend([
-            "autostretch",
-            f'save "../stacked_{filter_name}.fit"',
-            "close",
-            "exit"
-        ])
-        return "\n".join(lines)
-
-    # =========================================================================
-    # CASE B: STANDARD SEQUENCE (Multiple images)
-    # =========================================================================
-    # 1. Convert raw monochrome (CFA)
-    debug("CASE B: STANDARD SEQUENCE (Multi-images)")
-    debug(f"master_dark_path: {master_dark_path}")
-    debug(f"master_flat_path: {master_flat_path}")
-    debug(f"master_bias_path: {master_bias_path}")
-    debug(f"Any master: {has_masters}")
-
-    lines.append('convert light')
-    current_sequence = "light"
-
-    # 2. Calibration of the 'light' sequence
-    if has_masters:
-        calibrate_parts = ["calibrate light"]
-        if master_bias_path:
-            calibrate_parts.append(f"-bias={Path(master_bias_path).as_posix()}")
-        if master_dark_path:
-            path_str = Path(master_dark_path).as_posix()
-            clean_dark = path_str.replace('"', '').replace("'", "")
-            calibrate_parts.append(f"-dark={clean_dark}")
-        if master_flat_path:
-            calibrate_parts.append(f"-flat={Path(master_flat_path).as_posix()}")
-        if is_color:
-            calibrate_parts.extend(['-cfa', '-equalize_cfa'])
-        lines.append(" ".join(calibrate_parts))
-        current_sequence = "pp_light_"
-
-    # 3. De-mosaic the sequence via the preprocess command
+    # 2. Pré-traitement (Dématriçage)
     if is_color:
-        debayer_input = current_sequence.rstrip('_')
-        lines.extend([f"preprocess {debayer_input} -debayer", ""])
-        current_sequence = f"pp_{debayer_input}_"
+        lines.append(f"preprocess {seq} -debayer")
+        seq = f"pp_{seq}"
 
-    # 4. Register
-    lines.append(f'register {current_sequence}')
-    reg_base = current_sequence.rstrip('_')
-    stacked_seq = f"r_{reg_base}_"   # "r_light_", "r_pp_light_", "r_pp_pp_light_"
-
-    # 5. Stack + post-process
+    # 3. Registration & Stack
     lines.extend([
-        f'stack {stacked_seq} rej winsorized 3 3 -norm=add -weight_from_noise',
-        f'load {stacked_seq}stacked.fit',
-        "",
+        f'register {seq}',
+        f'stack r_{seq} rej winsorized 3 3 -norm=add -weight_from_noise',
+        f'load r_{seq}_stacked.fit',
         get_subsky_command(master_dark_path, master_flat_path, master_bias_path),
-        get_rmgreen_command(is_color),
+    ])
+
+    # 4. Post-processing (linear data, before stretch)
+    if is_color:
+        lines.append("rmgreen")
+    lines.extend([
+        "denoise -da3d -mod=0.7",
         "autostretch",
         f'save "../stacked_{filter_name}.fit"',
         "close",
         "exit"
     ])
+
     return "\n".join(lines)
 
 def generate_siril_script(session_dir: Path, filter_name: str, file_prefix: str) -> str:
@@ -576,7 +520,6 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
 
 def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, file_prefix: str) -> bool:
     """Combine normalized TIFF files and handle assembly palettes (LRVB / SHO / HOO / HOO+RGB)."""
-    from PIL import Image
     output_file = session_dir / f"{file_prefix}_full.{output_format}"
 
     # 1. Determine reference geometry for black areas (xc:black)
@@ -662,7 +605,6 @@ def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, fi
 def get_image_dimensions(ref_path: Path) -> tuple:
     """Get real dimensions of the master FITS for ImageMagick."""
     try:
-        from PIL import Image
         with Image.open(ref_path) as img:
             return img.size # Retourne (width, height)
     except Exception:
@@ -904,9 +846,9 @@ def run(args) -> bool:
         filter_work_dir.mkdir(parents=True, exist_ok=True)
 
         num_files = 0
-        for src_file in sorted(files_by_filter[current_filter]):
+        for i, src_file in enumerate(sorted(files_by_filter[current_filter]), start=1):
 #             clean_name = src_file.name.replace(" ", "_")
-            dst_name = f"light_{num_files:05d}{src_file.suffix.lower()}"
+            dst_name = f"light{i:05d}.fit"
             dst_file = filter_work_dir / dst_name
             if not dst_file.exists():
                 try:
@@ -931,11 +873,12 @@ def run(args) -> bool:
             f"stack_{current_filter}.ssf",
             work_dir=filter_work_dir
         )
+        stacked_file = current_session_dir / f"stacked_{current_filter}.fit"
 
         if filter_work_dir.is_dir():
             shutil.rmtree(filter_work_dir)
 
-        if not success:
+        if not success or not stacked_file.exists():
             emit("error", data={"step": "stacking_failed", "filter": current_filter})
             continue
         else:
@@ -1025,7 +968,6 @@ def run(args) -> bool:
     else:
         emit("error", data={"step": "composition_failed", "detail": "Final composition failed"})
 
-    emit("done", data={"uuid": session_uuid, "output_format": format_requested, "file_prefix": file_prefix})
     return True
 
 if __name__ == "__main__":
