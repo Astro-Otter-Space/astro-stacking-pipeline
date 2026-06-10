@@ -258,25 +258,18 @@ def get_subsky_command(
     # Base parameters depending on flat availability
     if has_flat:
         base_cmd = 'subsky -rbf'
-        common_params = '-smooth=0.5 -samples=25' if nb_missing == 0 else '-smooth=0.6 -samples=25'
-        tolerance = 1.2 if nb_missing == 0 else 1.6
+        common_params = '-smooth=0.4 -samples=50'
+        tolerance = 1.2 if nb_missing == 0 else 1.4
         return f'{base_cmd} -tolerance={tolerance} {common_params}'
     else:
         base_cmd = 'subsky'
-        smooth = 0.75
-        samples = 35
+        degree = 3
         if nb_missing == 1:
-            degree = 2
-            tolerance = 1.2
+            tolerance, smooth, samples = 1.4, 0.70, 60
         elif nb_missing == 2:
-            degree = 2
-            tolerance = 1.3
-            smooth = 0.70
+           tolerance, smooth, samples = 1.5, 0.75, 65
         else:  # nb_missing == 3
-            degree = 3
-            tolerance = 1.8
-            smooth = 0.80
-            samples = 40
+            tolerance, smooth, samples = 1.6, 0.85, 70
         return f'{base_cmd} {degree} -tolerance={tolerance} -smooth={smooth} -samples={samples}'
 
 def get_color_calibration_command(is_color: bool) -> str:
@@ -310,7 +303,7 @@ def get_rmgreen_command(is_color: bool) -> str:
     Generate the noise removal command for green (SCNR).
     Only relevant on color sensors.
     """
-    return "rmgreen" if is_color else ""
+    return "rmgreen -amount=0.5" if is_color else ""
 
 def _seq_detect_block(seq_prefix: str) -> list:
     """Génère un bloc de détection de séquence Siril."""
@@ -435,89 +428,6 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
 # --------------------------------------------------------------------------
 # CHROMINANCE & COMPOSITION VIA IMAGEMAGICK
 # --------------------------------------------------------------------------
-# def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, file_prefix: str) -> bool:
-#     """Combine normalized TIFF files and handle assembly palettes (LRVB / SHO / HOO / HOO+RGB)."""
-#     output_file = session_dir / f"{file_prefix}_full.{output_format}"
-#
-#     # Canal unique (Mono ou extraction brute simple)
-#     if len(tif_files) == 1:
-#         single_channel = list(tif_files.values())[0]
-#         cmd = ["convert", str(single_channel)]
-#         if output_format in ["webp", "jpg"]:
-#             cmd.extend(["-quality", "95"])
-#         cmd.append(str(output_file))
-#         try:
-#             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-#             return result.returncode == 0
-#         except Exception as e:
-#             debug(f"Échec ImageMagick Canal Unique : {e}")
-#             return False
-#
-#     # --- ÉTAPE 1 : DÉTERMINATION DU MODE D'ASSEMBLAGE ---
-#     cmd = ["convert"]
-#
-#     # Vérification de la présence des blocs de filtres
-#     has_narrowband = "HA" in tif_files and "OIII" in tif_files
-#     has_rgb = "RED" in tif_files and "GREEN" in tif_files and "BLUE" in tif_files
-#
-#     # CAS SPÉCIAL EXCLUSIF : HOO + RGB (Mixage avancé pour étoiles colorées)
-#     if has_narrowband and has_rgb:
-#         # On prépare les paires de mixage (Nébuleuse x Étoiles)
-#         # R = 80% HA + 20% RED
-#         # G = 80% OIII + 20% GREEN
-#         # B = 80% OIII + 20% BLUE
-#         mix_channels = [
-#             (tif_files["HA"], tif_files["RED"]),
-#             (tif_files["OIII"], tif_files["GREEN"]),
-#             (tif_files["OIII"], tif_files["BLUE"])
-#         ]
-#
-#         for nb_file, rgb_file in mix_channels:
-#             # En syntaxe subprocess, les parenthèses d'ImageMagick doivent être des éléments isolés
-#             cmd.extend(["(", str(nb_file), str(rgb_file), "-blend", "80x20", ")"])
-#
-#     # CAS STANDARDS (SHO, HOO pur, ou RVB classique)
-#     else:
-#         # Assignation par défaut / RVB classique
-#         r_channel = tif_files.get("RED", tif_files.get("HA", "xc:black"))
-#         g_channel = tif_files.get("GREEN", tif_files.get("OIII", "xc:black"))
-#         b_channel = tif_files.get("BLUE", tif_files.get("SII", "xc:black"))
-#
-#         # Mapping des palettes bandes étroites
-#         if "HA" in tif_files and "OIII" in tif_files and "SII" in tif_files:
-#             # Palette SHO (Hubble) -> R=SII, G=Ha, B=OIII
-#             r_channel = tif_files["SII"]
-#             g_channel = tif_files["HA"]
-#             b_channel = tif_files["OIII"]
-#         elif "HA" in tif_files and "OIII" in tif_files and "SII" not in tif_files:
-#             # Palette HOO -> R=Ha, G=OIII, B=OIII
-#             r_channel = tif_files["HA"]
-#             g_channel = tif_files["OIII"]
-#             b_channel = tif_files["OIII"]
-#
-#         # Ajout des canaux à la commande
-#         for channel in [r_channel, g_channel, b_channel]:
-#             if channel == "xc:black":
-#                 cmd.extend(["-size", f"{ref_path.width}x{ref_path.height}", "xc:black"])
-#             else:
-#                 cmd.append(str(channel))
-#
-#     # --- ÉTAPE 2 : FINALISATION ET EXÉCUTION ---
-#     cmd.append("-combine")
-#     if output_format in ["webp", "jpg"]:
-#         cmd.extend(["-quality", "95"])
-#     cmd.append(str(output_file))
-#
-#     debug(f"Exécution de la synthèse chromatique ImageMagick : {' '.join(cmd)}")
-#     try:
-#         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-#         if result.returncode != 0:
-#             debug(f"Erreur ImageMagick STDERR : {result.stderr}")
-#         return result.returncode == 0
-#     except Exception as e:
-#         debug(f"Échec de l'assemblage composite ImageMagick : {e}")
-#         return False
-
 def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, file_prefix: str) -> bool:
     """Combine normalized TIFF files and handle assembly palettes (LRVB / SHO / HOO / HOO+RGB)."""
     output_file = session_dir / f"{file_prefix}_full.{output_format}"
@@ -582,12 +492,11 @@ def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, fi
     # --- STEP 2: FINALIZATION AND EXECUTION ---
     cmd.extend([
         "-despeckle",
-        "-median", "1",
-        "-level", "2%,98%,1.0",
+        "-level", "2%,98%,1.1",
         "-combine",
-        "-colorspace", "sRGB"
+        "-colorspace", "sRGB",
+        "-unsharp", "0x1.5+1+0.002"
     ])
-#     cmd.extend(["-level", "1%,100%,1.0", "-despeckle", "-combine", "-colorspace", "sRGB"])
     if output_format in ["webp", "jpg"]:
         cmd.extend(["-quality", "95"])
     cmd.append(str(output_file))
