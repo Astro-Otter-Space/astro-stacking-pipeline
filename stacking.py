@@ -67,16 +67,54 @@ def is_color_camera(fits_path: Path) -> bool:
     """Analyze FITS header to determine if sensor is color (OSC)."""
     header = get_fits_header(fits_path)
     if not header:
+        debug(f"⚠️ No headers FITS, default MONO")
         return False
 
+    debug(f"=== Détection Capteur ===")
+    debug(f"  INSTRUME: {header.get('INSTRUME', 'N/A')}")
+    debug(f"  BAYERPAT: {header.get('BAYERPAT', 'N/A')}")
+    debug(f"  XBAYROFF: {header.get('XBAYROFF', 'N/A')}")
+    debug(f"  CFAHEADER: {header.get('CFAHEADER', 'N/A')}")
+    debug(f"  COLOR: {header.get('COLOR', 'N/A')}")
+
     if 'BAYERPAT' in header or 'XBAYROFF' in header or 'CFAHEADER' in header:
+        debug(f"  → Result: COLOR (Bayer detected)")
         return True
 
     instrument = header.get('INSTRUME', '').upper()
     if 'MC' in instrument and 'MM' not in instrument:
+        debug(f"  → Result: COLOR (instrument MC)")
+        return True
+
+    if header.get('COLOR', '') == 'YES':
+        debug(f"  → Result: COLOR (keyword COLOR=YES)")
         return True
 
     return False
+
+def get_fits_bitdepth(fits_path: Path) -> int:
+    """
+    Détecte la profondeur de bits d'un fichier FITS.
+    Retourne 16 ou 32 selon le format des données.
+    """
+    try:
+        with fits.open(fits_path, mode='readonly', ignore_missing_end=True) as hdul:
+            data = hdul[0].data
+            dtype = data.dtype
+
+            # Détection selon le type numpy
+            if dtype == np.uint16:
+                return 16
+            elif dtype == np.uint32:
+                return 32
+            elif dtype == np.float32 or dtype == np.float64:
+                return 32
+            else:
+                debug(f"Bit depth inconnu: {dtype}, défaut 32-bit")
+                return 32
+    except Exception as e:
+        debug(f"Impossible de lire le bit depth de {fits_path}: {e}")
+        return 32  # Défaut sécurisé
 
 # --------------------------------------------------------------------------
 # DOF (DARKS, FLATS, BIAS)
@@ -303,7 +341,7 @@ def get_rmgreen_command(is_color: bool) -> str:
     Generate the noise removal command for green (SCNR).
     Only relevant on color sensors.
     """
-    return "rmgreen -amount=0.5" if is_color else ""
+    return "rmgreen 0" if is_color else ""
 
 def _seq_detect_block(seq_prefix: str) -> list:
     """Génère un bloc de détection de séquence Siril."""
@@ -324,13 +362,15 @@ def generate_siril_stack_script(
     is_color: bool,
     master_dark_path: str = None,
     master_flat_path: str = None,
-    master_bias_path: str = None
+    master_bias_path: str = None,
+   output_bits: int = 32
 ) -> str:
     """
     Génère le script .ssf pour Siril.
     num_files: utilisé pour valider qu'on a au moins 2 images pour le stack.
     """
     abs_work_dir = filter_work_dir.resolve().as_posix()
+    fits_format = "TFLOAT" if output_bits == 32 else "UINT16"
 
     lines = [
         "requires 1.2.0",
@@ -363,12 +403,11 @@ def generate_siril_stack_script(
     ])
 
     # 4. Post-processing (linear data, before stretch)
-    if is_color:
-        lines.append("rmgreen")
     lines.extend([
+        get_rmgreen_command(is_color),
         "denoise -da3d -mod=0.7",
         "autostretch",
-        f'save "../stacked_{filter_name}.fit"',
+        f'save "../stacked_{filter_name}.fit" -format={fits_format}',
         "close",
         "exit"
     ])
@@ -403,6 +442,11 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
     cmd = ["siril-cli", "-s", str(script_path)]
     effective_cwd = str(work_dir) if work_dir else str(session_dir)
     debug(f"Check effective_cwd: {effective_cwd}")
+
+    debug(f"=== Script Siril ({script_name}) ===")
+    debug(script_content)
+    debug(f"=== Fin du Script ===")
+
     try:
         process = subprocess.Popen(
             cmd,
@@ -413,7 +457,8 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
         )
 
         for line in process.stdout:
-            if any(k in line.lower() for k in ["error", "failed", "inconnue"]):
+            line = line.strip()
+            if line:
                 debug(f"[Siril LOG] {line.strip()}")
 
         process.wait()
@@ -642,6 +687,16 @@ def run(args) -> bool:
     format_requested = args.format.lower()
     dso_name = re.sub(r'[^a-zA-Z0-9_-]', '', args.dso.lower().replace(" ", ""))
 
+    first_light = None
+    for f in lights_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in ['.fits', '.fit', '.fts']:
+            first_light = f
+            break
+    output_bits = 32
+    if first_light:
+        output_bits = get_fits_bitdepth(first_light)
+        debug(f"Detected Bit depth from {first_light.name}: {output_bits}-bit")
+
     # Generate timestamp
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     file_prefix = f"{dso_name}_{timestamp}"
@@ -774,7 +829,8 @@ def run(args) -> bool:
             camera_is_color,
             master_dark_path,
             master_flat_path,
-            master_bias_path
+            master_bias_path,
+            output_bits=output_bits
         )
         success = run_siril_command(
             current_session_dir,
@@ -782,7 +838,24 @@ def run(args) -> bool:
             f"stack_{current_filter}.ssf",
             work_dir=filter_work_dir
         )
+
+        debug(f"=== Files in {filter_work_dir} ===")
+        for f in filter_work_dir.glob("*.fit"):
+            debug(f"  FITS: {f.name}")
+        for f in filter_work_dir.glob("*.seq"):
+            debug(f"  SEQ: {f.name}")
+        debug(f"============================")
+
         stacked_file = current_session_dir / f"stacked_{current_filter}.fit"
+        if stacked_file.exists():
+            debug(f"✅ Stacked file found: {stacked_file.name} ({stacked_file.stat().st_size} bytes)")
+        else:
+            debug(f"❌ Missed stacked file: {stacked_file.name}")
+            success = False  # ✅ Forcer l'échec si pas de fichier
+
+        if not success:
+            emit("error", data={"step": "stacking_failed", "filter": current_filter})
+            continue
 
         if filter_work_dir.is_dir():
             shutil.rmtree(filter_work_dir)
