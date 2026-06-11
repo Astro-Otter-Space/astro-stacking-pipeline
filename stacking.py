@@ -148,118 +148,6 @@ def ensure_2d_master(master_path: Path) -> Path | None:
         debug(f"Failed to normalize FITS 2D for {master_path.name} : {e}")
         return None
 
-# def get_master_dark_path(session_dir: Path, filter_name: str = None) -> str | None:
-#     """
-#     Look for a master dark. Prioritize filter-specific master, then generic master_dark.
-#     Supports naming patterns like: masterDark_*_FILTER-{filter}_*.fit(s)
-#     """
-#     darks_dir = session_dir / "darks"
-#     if not darks_dir.is_dir():
-#         return None
-#
-#     def resolve_master(path: Path) -> str | None:
-#         """Apply ensure_2d_master and return resolved path string, or None."""
-#         m2d = ensure_2d_master(path)
-#         if m2d:
-#             return str(m2d.resolve())
-#         debug(f"ensure_2d_master failed for {path.name}, using original")
-#         return str(path.resolve())
-#
-#     def find_by_pattern(pattern: str) -> Path | None:
-#         """Return the most recently modified match for a glob pattern, or None."""
-#         matches = sorted(
-#             darks_dir.glob(pattern),
-#             key=lambda p: p.stat().st_mtime,
-#             reverse=True
-#         )
-#         return matches[0] if matches else None
-#
-#     # 1. Filter-specific master dark (case variants: HA, Ha, ha)
-#     if filter_name:
-#         variants = {filter_name, filter_name.upper(), filter_name.lower(), filter_name.capitalize()}
-#         for variant in variants:
-#             for ext in ('.fit', '.fits'):
-#                 match = find_by_pattern(f"*FILTER-{variant}*{ext}")
-#                 if match:
-#                     debug(f"Filter-specific dark found: {match.name}")
-#                     return resolve_master(match)
-#
-#     # 2. Generic master dark
-#     for ext in ('.fit', '.fits'):
-#         generic = darks_dir / f"master_dark{ext}"
-#         if generic.exists():
-#             debug(f"Generic dark found: {generic.name}")
-#             return resolve_master(generic)
-#
-#     debug(f"No master dark found in {darks_dir}")
-#     return None
-#
-# def get_master_flat_path(session_dir: Path, filter_name: str) -> str | None:
-#     """
-#     Look for a master flat. Prioritize a generic master_flat,
-#     otherwise search for a file containing the filter name in its name.
-#     Exclude temporary gradient files *_2d.fit.
-#     """
-#     flats_dir = session_dir / "flats"
-#     if not flats_dir.is_dir():
-#         return None
-#
-#     # 1. Search for a direct generic master flat
-#     for ext in ['.fit', '.fits']:
-#         master_file = flats_dir / f"master_flat{ext}"
-#         if master_file.exists():
-#             m2d = ensure_2d_master(master_file)
-#             return str(m2d.resolve()) if m2d else str(master_file.resolve())
-#
-#     # 2. Search by filter name match
-#     for ext in ['.fit', '.fits']:
-#         filter_pattern = f"*{filter_name}*{ext}"
-#         # Filter results to ignore residuals _2d.fit
-#         matches = [f for f in flats_dir.glob(filter_pattern) if not f.name.endswith(f"_2d{ext}")]
-#
-#         ## Fallback in case filter is written differently (e.g., ha instead of HA)
-#         if not matches:
-#             matches = [f for f in flats_dir.glob(f"*{filter_name.lower()}*{ext}") if not f.name.endswith(f"_2d{ext}")]
-#
-#         if matches:
-#             # If the found file is a single raw (doesn't contain 'master')
-#             if "master" not in matches[0].name.lower():
-#                 return str((flats_dir / f"master_flat_{filter_name}.fit").resolve())
-#
-#             m2d = ensure_2d_master(matches[0])
-#             return str(m2d.resolve()) if m2d else str(matches[0].resolve())
-#
-#     return None
-#
-#
-# def get_master_bias_path(session_dir: Path) -> str | None:
-#     """
-#     Look for a standard master bias (offset) in the dedicated subdirectory.
-#     Exclude temporary gradient files *_2d.fit.
-#     """
-#     bias_dir = session_dir / "bias"
-#     if not bias_dir.is_dir():
-#         return None
-#
-#     for ext in ['.fit', '.fits']:
-#         master_file = bias_dir / f"master_bias{ext}"
-#         if master_file.exists():
-#             m2d = ensure_2d_master(master_file)
-#             return str(m2d.resolve()) if m2d else str(master_file.resolve())
-#
-#     # Fallback: if there are single FITS files but no 'master_bias.fit'
-#     for ext in ['.fit', '.fits']:
-#         all_fits = [f for f in bias_dir.glob(f"*{ext}") if not f.name.endswith(f"_2d{ext}")]
-#         if all_fits:
-#             # If the first file found doesn't have 'master' in its name, schedule its creation
-#             if "master" not in all_fits[0].name.lower():
-#                 return str((bias_dir / "master_bias.fit").resolve())
-#
-#             m2d = ensure_2d_master(all_fits[0])
-#             return str(m2d.resolve()) if m2d else str(all_fits[0].resolve())
-#
-#     return None
-
 def _find_master_dof(
     dof_dir: Path,
     generic_name: str,
@@ -401,22 +289,82 @@ def get_color_calibration_command(is_color: bool) -> str:
     # Détecte le fond du ciel et balance les blancs de manière itérative et locale
     return ""
 
+NARROWBAND_FILTERS = {'HA', 'OIII', 'SII', 'H_BETA'}
+DENOISE_FRAME_THRESHOLD = 10
+
+def should_apply_denoise(
+    filter_name: str,
+    num_files: int,
+    is_color: bool,
+    all_detected_filters: list[str],
+    master_dark_path: str = None,
+    master_flat_path: str = None,
+    master_bias_path: str = None,
+) -> tuple[bool, float]:
+    """
+    Détermine automatiquement si denoise doit être appliqué et avec quel mod.
+    Retourne (apply: bool, mod: float).
+
+    Règles d'exclusion (prioritaires) :
+    - Caméra couleur OSC → désactivé (déséquilibre inter-canal garanti)
+    - Palette multi-filtre (SHO/HOO) → désactivé (mod différent par filtre = cast coloré)
+
+    Règles d'activation :
+    - Narrowband mono + stack court → activé
+    - Narrowband mono + DOF manquants → activé
+    - Stack très court (< 5) quelle que soit la config mono → activé
+
+    Le mod s'adapte à la qualité de calibration disponible.
+    """
+
+    # --- EXCLUSIONS PRIORITAIRES ---
+
+    # Caméra couleur : jamais — le denoise par canal OSC crée un déséquilibre
+    if is_color:
+        debug(f"Denoise [{filter_name}]: OFF — caméra couleur OSC")
+        return False, 0.0
+
+    # Palette multi-filtre narrowband : jamais — cause observée de la dominante verte
+    active_narrowband = [f for f in all_detected_filters if f in NARROWBAND_FILTERS]
+    if len(active_narrowband) > 1:
+        debug(f"Denoise [{filter_name}]: OFF — palette multi-filtre {active_narrowband}")
+        return False, 0.0
+
+    # --- CALCUL DU MOD selon qualité de calibration ---
+    has_dark = bool(master_dark_path)
+    has_flat = bool(master_flat_path)
+    has_bias = bool(master_bias_path)
+    dof_count = sum([has_dark, has_flat, has_bias])
+
+    # Plus on a de DOF, moins le bruit résiduel est élevé → mod plus faible
+    if dof_count == 3:
+        mod = 0.4   # Calibration complète — touche légère
+    elif dof_count == 2:
+        mod = 0.55
+    elif dof_count == 1:
+        mod = 0.7   # Valeur de référence
+    else:
+        mod = 0.85  # Aucun DOF — plus agressif
+
+    # --- CONDITIONS D'ACTIVATION ---
+    is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
+    is_short_stack = num_files < DENOISE_FRAME_THRESHOLD
+    is_very_short = num_files < 5
+
+    apply = is_very_short or (is_narrowband and is_short_stack) or (is_narrowband and dof_count == 0)
+
+    debug(
+        f"Denoise [{filter_name}]: {'ON' if apply else 'OFF'} "
+        f"(narrowband={is_narrowband}, frames={num_files}, dof={dof_count}/3, mod={mod if apply else '-'})"
+    )
+    return apply, mod
+
 def get_rmgreen_command(is_color: bool) -> str:
     """
     Generate the noise removal command for green (SCNR).
     Only relevant on color sensors.
     """
     return "rmgreen 0.3" if is_color else ""
-
-def _seq_detect_block(seq_prefix: str) -> list:
-    """Génère un bloc de détection de séquence Siril."""
-    return [
-        f'set seq_name "{seq_prefix}"',
-        f'if [ -f "{seq_prefix}_.seq" ]; then',
-        f'    set seq_name "{seq_prefix}_"',
-        'endif',
-        'load $seq_name'
-    ]
 # --------------------------------------------------------------------------
 # GENERATE NATIVE SIRIL SCRIPTS (.SSF)
 # --------------------------------------------------------------------------
@@ -425,6 +373,7 @@ def generate_siril_stack_script(
     filter_name: str,
     num_files: int,
     is_color: bool,
+    all_detected_filters: list[str],
     master_dark_path: str = None,
     master_flat_path: str = None,
     master_bias_path: str = None,
@@ -464,12 +413,19 @@ def generate_siril_stack_script(
         f'register {seq}',
         f'stack r_{seq} rej winsorized 3 3 -norm=add -weight_from_noise',
         f'load r_{seq}_stacked.fit',
-        get_subsky_command(master_dark_path, master_flat_path, master_bias_path),
     ])
+
+    apply_denoise, denoise_mod = should_apply_denoise(
+        filter_name, num_files, is_color,
+        all_detected_filters,
+        master_dark_path, master_flat_path, master_bias_path
+    )
 
     # 4. Post-processing (linear data, before stretch)
     lines.extend([
+        get_subsky_command(master_dark_path, master_flat_path, master_bias_path),
         get_rmgreen_command(is_color),
+        f"denoise -da3d -mod={denoise_mod}" if apply_denoise else "",
         "autostretch",
         bit_cmd,
         f'save "../stacked_{filter_name}.fit"',
@@ -880,11 +836,12 @@ def run(args) -> bool:
 #             clean_name = src_file.name.replace(" ", "_")
             dst_name = f"light{i:05d}.fit"
             dst_file = filter_work_dir / dst_name
-            if not dst_file.exists():
-                try:
-                    dst_file.symlink_to(src_file.resolve())
-                except OSError:
-                    shutil.copy(src_file, dst_file)
+            if dst_file.exists() or dst_file.is_symlink():
+                dst_file.unlink()
+            try:
+                dst_file.symlink_to(src_file.resolve())
+            except OSError:
+                shutil.copy(src_file, dst_file)
             num_files += 1
 
         # Generate and execute stacking script
@@ -893,6 +850,7 @@ def run(args) -> bool:
             current_filter,
             num_files,
             camera_is_color,
+            detected_filters,
             master_dark_path,
             master_flat_path,
             master_bias_path,
@@ -921,16 +879,13 @@ def run(args) -> bool:
 
         if not success:
             emit("error", data={"step": "stacking_failed", "filter": current_filter})
+            if filter_work_dir.is_dir():
+                shutil.rmtree(filter_work_dir)
             continue
 
+        emit("progress", data={"step": "stacking_done", "filter": current_filter})
         if filter_work_dir.is_dir():
             shutil.rmtree(filter_work_dir)
-
-        if not success or not stacked_file.exists():
-            emit("error", data={"step": "stacking_failed", "filter": current_filter})
-            continue
-        else:
-            emit("progress", data={"step": "stacking_done", "filter": current_filter})
 
         siril_default_fit = current_session_dir / f"stacked_{current_filter}.fit"
         custom_fit_name = current_session_dir / f"{file_prefix}_{current_filter}.fit"
