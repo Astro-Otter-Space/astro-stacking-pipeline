@@ -94,27 +94,19 @@ def is_color_camera(fits_path: Path) -> bool:
 
 def get_fits_bitdepth(fits_path: Path) -> int:
     """
-    Détecte la profondeur de bits d'un fichier FITS.
-    Retourne 16 ou 32 selon le format des données.
+    Détecte la profondeur de bits via BITPIX du header FITS.
+    BITPIX=16 → 16-bit entier signé
+    BITPIX=-32 → float32, BITPIX=-64 → float64 → 32-bit
     """
     try:
         with fits.open(fits_path, mode='readonly', ignore_missing_end=True) as hdul:
-            data = hdul[0].data
-            dtype = data.dtype
-
-            # Détection selon le type numpy
-            if dtype == np.uint16:
-                return 16
-            elif dtype == np.uint32:
-                return 32
-            elif dtype == np.float32 or dtype == np.float64:
-                return 32
-            else:
-                debug(f"Bit depth inconnu: {dtype}, défaut 32-bit")
-                return 32
+            bitpix = hdul[0].header.get('BITPIX', -32)
+            detected = 16 if bitpix == 16 else 32
+            debug(f"BITPIX={bitpix} → {detected}-bit")
+            return detected
     except Exception as e:
         debug(f"Impossible de lire le bit depth de {fits_path}: {e}")
-        return 32  # Défaut sécurisé
+        return 32
 
 # --------------------------------------------------------------------------
 # DOF (DARKS, FLATS, BIAS)
@@ -137,10 +129,10 @@ def ensure_2d_master(master_path: Path) -> Path | None:
         with fits.open(master_path) as hdul:
             header = hdul[0].header.copy()
             data = hdul[0].data
-
+            original_dtype = data.dtype
         # Si l'image a été lue ou sauvée par erreur en RGB (3D)
         if data.ndim == 3:
-            data = np.mean(data, axis=-1)  # Fusion propre en intensité pure
+            data = np.mean(data, axis=-1).astype(original_dtype)  # Fusion propre en intensité pure
             header.add_comment('Master normalized to 2D structure')
         elif data.ndim != 2:
             debug(f"Invalid image structure for calibration: {data.ndim} dimensions")
@@ -156,121 +148,186 @@ def ensure_2d_master(master_path: Path) -> Path | None:
         debug(f"Failed to normalize FITS 2D for {master_path.name} : {e}")
         return None
 
-def get_master_dark_path(session_dir: Path, light_files: list[Path]) -> str | None:
+# def get_master_dark_path(session_dir: Path, filter_name: str = None) -> str | None:
+#     """
+#     Look for a master dark. Prioritize filter-specific master, then generic master_dark.
+#     Supports naming patterns like: masterDark_*_FILTER-{filter}_*.fit(s)
+#     """
+#     darks_dir = session_dir / "darks"
+#     if not darks_dir.is_dir():
+#         return None
+#
+#     def resolve_master(path: Path) -> str | None:
+#         """Apply ensure_2d_master and return resolved path string, or None."""
+#         m2d = ensure_2d_master(path)
+#         if m2d:
+#             return str(m2d.resolve())
+#         debug(f"ensure_2d_master failed for {path.name}, using original")
+#         return str(path.resolve())
+#
+#     def find_by_pattern(pattern: str) -> Path | None:
+#         """Return the most recently modified match for a glob pattern, or None."""
+#         matches = sorted(
+#             darks_dir.glob(pattern),
+#             key=lambda p: p.stat().st_mtime,
+#             reverse=True
+#         )
+#         return matches[0] if matches else None
+#
+#     # 1. Filter-specific master dark (case variants: HA, Ha, ha)
+#     if filter_name:
+#         variants = {filter_name, filter_name.upper(), filter_name.lower(), filter_name.capitalize()}
+#         for variant in variants:
+#             for ext in ('.fit', '.fits'):
+#                 match = find_by_pattern(f"*FILTER-{variant}*{ext}")
+#                 if match:
+#                     debug(f"Filter-specific dark found: {match.name}")
+#                     return resolve_master(match)
+#
+#     # 2. Generic master dark
+#     for ext in ('.fit', '.fits'):
+#         generic = darks_dir / f"master_dark{ext}"
+#         if generic.exists():
+#             debug(f"Generic dark found: {generic.name}")
+#             return resolve_master(generic)
+#
+#     debug(f"No master dark found in {darks_dir}")
+#     return None
+#
+# def get_master_flat_path(session_dir: Path, filter_name: str) -> str | None:
+#     """
+#     Look for a master flat. Prioritize a generic master_flat,
+#     otherwise search for a file containing the filter name in its name.
+#     Exclude temporary gradient files *_2d.fit.
+#     """
+#     flats_dir = session_dir / "flats"
+#     if not flats_dir.is_dir():
+#         return None
+#
+#     # 1. Search for a direct generic master flat
+#     for ext in ['.fit', '.fits']:
+#         master_file = flats_dir / f"master_flat{ext}"
+#         if master_file.exists():
+#             m2d = ensure_2d_master(master_file)
+#             return str(m2d.resolve()) if m2d else str(master_file.resolve())
+#
+#     # 2. Search by filter name match
+#     for ext in ['.fit', '.fits']:
+#         filter_pattern = f"*{filter_name}*{ext}"
+#         # Filter results to ignore residuals _2d.fit
+#         matches = [f for f in flats_dir.glob(filter_pattern) if not f.name.endswith(f"_2d{ext}")]
+#
+#         ## Fallback in case filter is written differently (e.g., ha instead of HA)
+#         if not matches:
+#             matches = [f for f in flats_dir.glob(f"*{filter_name.lower()}*{ext}") if not f.name.endswith(f"_2d{ext}")]
+#
+#         if matches:
+#             # If the found file is a single raw (doesn't contain 'master')
+#             if "master" not in matches[0].name.lower():
+#                 return str((flats_dir / f"master_flat_{filter_name}.fit").resolve())
+#
+#             m2d = ensure_2d_master(matches[0])
+#             return str(m2d.resolve()) if m2d else str(matches[0].resolve())
+#
+#     return None
+#
+#
+# def get_master_bias_path(session_dir: Path) -> str | None:
+#     """
+#     Look for a standard master bias (offset) in the dedicated subdirectory.
+#     Exclude temporary gradient files *_2d.fit.
+#     """
+#     bias_dir = session_dir / "bias"
+#     if not bias_dir.is_dir():
+#         return None
+#
+#     for ext in ['.fit', '.fits']:
+#         master_file = bias_dir / f"master_bias{ext}"
+#         if master_file.exists():
+#             m2d = ensure_2d_master(master_file)
+#             return str(m2d.resolve()) if m2d else str(master_file.resolve())
+#
+#     # Fallback: if there are single FITS files but no 'master_bias.fit'
+#     for ext in ['.fit', '.fits']:
+#         all_fits = [f for f in bias_dir.glob(f"*{ext}") if not f.name.endswith(f"_2d{ext}")]
+#         if all_fits:
+#             # If the first file found doesn't have 'master' in its name, schedule its creation
+#             if "master" not in all_fits[0].name.lower():
+#                 return str((bias_dir / "master_bias.fit").resolve())
+#
+#             m2d = ensure_2d_master(all_fits[0])
+#             return str(m2d.resolve()) if m2d else str(all_fits[0].resolve())
+#
+#     return None
+
+def _find_master_dof(
+    dof_dir: Path,
+    generic_name: str,
+    filter_name: str | None = None
+) -> str | None:
     """
-    Look for an appropriate master dark. Prioritize a generic master_dark,
-    otherwise search by exposure time match (EXPTIME/EXPOSURE).
+    Generic DOF master finder (dark, flat, bias).
+    Prioritizes filter-specific master, then generic master_{type}.
+    Excludes _2d files (already processed intermediates).
+    Matches case variants: HA / Ha / ha / Ha (capitalize).
+    Returns the most recently modified match.
     """
-    darks_dir = session_dir / "darks"
-    if not darks_dir.is_dir():
+    if not dof_dir.is_dir():
         return None
 
-    # 1. Recherche d'un master dark générique direct
-    for ext in ['.fit', '.fits']:
-        master_file = darks_dir / f"master_dark{ext}"
-        if master_file.exists():
-            m2d = ensure_2d_master(master_file)
-            return str(m2d.resolve()) if m2d else str(master_file.resolve())
+    def resolve_master(path: Path) -> str:
+        m2d = ensure_2d_master(path)
+        if m2d:
+            return str(m2d.resolve())
+        debug(f"ensure_2d_master failed for {path.name}, using original")
+        return str(path.resolve())
 
-    # 2. Si pas de master générique, extraction du temps de pose de la première brute valide
-    exposure = None
-    for light in light_files:
-        try:
-            with fits.open(light, mode='readonly', ignore_missing_end=True) as hdul:
-                header = hdul[0].header
-                exposure = header.get('EXPTIME') or header.get('EXPOSURE')
-                if exposure is not None:
-                    exposure = float(exposure)
-                    break
-        except Exception as e:
-            debug(f"Unable to read exposure from {light.name}: {e}")
-            continue
+    def find_by_pattern(pattern: str) -> Path | None:
+        matches = sorted(
+            (
+                p for p in dof_dir.glob(pattern)
+                if not p.stem.endswith("_2d")
+            ),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        return matches[0] if matches else None
 
-    if exposure is None:
-        return None
+    # 1. Filter-specific (4 variantes de casse)
+    if filter_name:
+        variants = {filter_name, filter_name.upper(), filter_name.lower(), filter_name.capitalize()}
+        for variant in variants:
+            for ext in ('.fit', '.fits'):
+                match = find_by_pattern(f"*FILTER-{variant}*{ext}")
+                if match:
+                    debug(f"Filter-specific {generic_name} found: {match.name}")
+                    return resolve_master(match)
 
-    # 3. Recherche par pattern de temps de pose (ex: EXPOSURE-30.00s ou 30s)
-    for ext in ['.fit', '.fits']:
-        patterns = [
-            f"*EXPOSURE-{exposure:.2f}s*{ext}",
-            f"*EXPOSURE-{int(exposure)}s*{ext}",
-            f"*{int(exposure)}s*{ext}"
-        ]
-        for pattern in patterns:
-            matches = list(darks_dir.glob(pattern))
-            if matches:
-                # Take the first match found
-                m2d = ensure_2d_master(matches[0])
-                return str(m2d.resolve()) if m2d else str(matches[0].resolve())
+    # 2. Generic fallback : master_dark.fit / master_flat.fit / master_bias.fit
+    for ext in ('.fit', '.fits'):
+        generic = dof_dir / f"{generic_name}{ext}"
+        if generic.exists():
+            debug(f"Generic {generic_name} found: {generic.name}")
+            return resolve_master(generic)
 
+    debug(f"No {generic_name} found in {dof_dir}")
     return None
 
 
-def get_master_flat_path(session_dir: Path, filter_name: str) -> str | None:
-    """
-    Look for a master flat. Prioritize a generic master_flat,
-    otherwise search for a file containing the filter name in its name.
-    Exclude temporary gradient files *_2d.fit.
-    """
-    flats_dir = session_dir / "flats"
-    if not flats_dir.is_dir():
-        return None
-
-    # 1. Search for a direct generic master flat
-    for ext in ['.fit', '.fits']:
-        master_file = flats_dir / f"master_flat{ext}"
-        if master_file.exists():
-            m2d = ensure_2d_master(master_file)
-            return str(m2d.resolve()) if m2d else str(master_file.resolve())
-
-    # 2. Search by filter name match
-    for ext in ['.fit', '.fits']:
-        filter_pattern = f"*{filter_name}*{ext}"
-        # Filter results to ignore residuals _2d.fit
-        matches = [f for f in flats_dir.glob(filter_pattern) if not f.name.endswith(f"_2d{ext}")]
-
-        ## Fallback in case filter is written differently (e.g., ha instead of HA)
-        if not matches:
-            matches = [f for f in flats_dir.glob(f"*{filter_name.lower()}*{ext}") if not f.name.endswith(f"_2d{ext}")]
-
-        if matches:
-            # If the found file is a single raw (doesn't contain 'master')
-            if "master" not in matches[0].name.lower():
-                return str((flats_dir / f"master_flat_{filter_name}.fit").resolve())
-
-            m2d = ensure_2d_master(matches[0])
-            return str(m2d.resolve()) if m2d else str(matches[0].resolve())
-
-    return None
+def get_master_dark_path(session_dir: Path, filter_name: str | None = None) -> str | None:
+    """Look for a master dark. Filter-specific first, then generic master_dark."""
+    return _find_master_dof(session_dir / "darks", "master_dark", filter_name)
 
 
-def get_master_bias_path(session_dir: Path) -> str | None:
-    """
-    Look for a standard master bias (offset) in the dedicated subdirectory.
-    Exclude temporary gradient files *_2d.fit.
-    """
-    bias_dir = session_dir / "bias"
-    if not bias_dir.is_dir():
-        return None
+def get_master_flat_path(session_dir: Path, filter_name: str | None = None) -> str | None:
+    """Look for a master flat. Filter-specific first, then generic master_flat."""
+    return _find_master_dof(session_dir / "flats", "master_flat", filter_name)
 
-    for ext in ['.fit', '.fits']:
-        master_file = bias_dir / f"master_bias{ext}"
-        if master_file.exists():
-            m2d = ensure_2d_master(master_file)
-            return str(m2d.resolve()) if m2d else str(master_file.resolve())
 
-    # Fallback: if there are single FITS files but no 'master_bias.fit'
-    for ext in ['.fit', '.fits']:
-        all_fits = [f for f in bias_dir.glob(f"*{ext}") if not f.name.endswith(f"_2d{ext}")]
-        if all_fits:
-            # If the first file found doesn't have 'master' in its name, schedule its creation
-            if "master" not in all_fits[0].name.lower():
-                return str((bias_dir / "master_bias.fit").resolve())
-
-            m2d = ensure_2d_master(all_fits[0])
-            return str(m2d.resolve()) if m2d else str(all_fits[0].resolve())
-
-    return None
+def get_master_bias_path(session_dir: Path, filter_name: str | None = None) -> str | None:
+    """Look for a master bias. Filter-specific first, then generic master_bias.
+    Note: bias are usually filter-independent, but filter-specific ones are supported."""
+    return _find_master_dof(session_dir / "bias", "master_bias", filter_name)
 # --------------------------------------------------------------------------
 # SUBSKY - Gradient Optimization
 # --------------------------------------------------------------------------
@@ -290,6 +347,12 @@ def get_subsky_command(
     if not master_flat_path: missing.append("flat")
     if not master_bias_path: missing.append("bias")
 
+    debug(f"=== Subsky Masters Check ===")
+    debug(f"  Master Dark:  {'SET' if master_dark_path else 'MISSING'} ({master_dark_path})")
+    debug(f"  Master Flat:  {'SET' if master_flat_path else 'MISSING'} ({master_flat_path})")
+    debug(f"  Master Bias:  {'SET' if master_bias_path else 'MISSING'} ({master_bias_path})")
+    debug(f"  Missing: {missing}")
+
     has_flat = "flat" not in missing
     nb_missing = len(missing)
 
@@ -305,9 +368,11 @@ def get_subsky_command(
         if nb_missing == 1:
             tolerance, smooth, samples = 1.4, 0.70, 60
         elif nb_missing == 2:
-           tolerance, smooth, samples = 1.5, 0.75, 65
-        else:  # nb_missing == 3
+           tolerance, smooth, samples, degree = 1.8, 0.5, 65, 2
+        else:
             tolerance, smooth, samples = 1.6, 0.85, 70
+
+        emit("progress", data={"degree": degree,"tolerance": tolerance, "smooth": smooth, "samples": samples})
         return f'{base_cmd} {degree} -tolerance={tolerance} -smooth={smooth} -samples={samples}'
 
 def get_color_calibration_command(is_color: bool) -> str:
@@ -341,7 +406,7 @@ def get_rmgreen_command(is_color: bool) -> str:
     Generate the noise removal command for green (SCNR).
     Only relevant on color sensors.
     """
-    return "rmgreen 0" if is_color else ""
+    return "rmgreen 0.3" if is_color else ""
 
 def _seq_detect_block(seq_prefix: str) -> list:
     """Génère un bloc de détection de séquence Siril."""
@@ -363,14 +428,14 @@ def generate_siril_stack_script(
     master_dark_path: str = None,
     master_flat_path: str = None,
     master_bias_path: str = None,
-   output_bits: int = 32
+    output_bits: int = 32
 ) -> str:
     """
-    Génère le script .ssf pour Siril.
-    num_files: utilisé pour valider qu'on a au moins 2 images pour le stack.
+    Generates the .ssf script for Siril.
+    num_files: used to validate that we have at least 2 images for the stack
     """
     abs_work_dir = filter_work_dir.resolve().as_posix()
-    fits_format = "TFLOAT" if output_bits == 32 else "UINT16"
+    bit_cmd = "set32bits" if output_bits == 32 else "set16bits"
 
     lines = [
         "requires 1.2.0",
@@ -405,9 +470,9 @@ def generate_siril_stack_script(
     # 4. Post-processing (linear data, before stretch)
     lines.extend([
         get_rmgreen_command(is_color),
-        "denoise -da3d -mod=0.7",
         "autostretch",
-        f'save "../stacked_{filter_name}.fit" -format={fits_format}',
+        bit_cmd,
+        f'save "../stacked_{filter_name}.fit"',
         "close",
         "exit"
     ])
@@ -540,6 +605,7 @@ def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, fi
         "-level", "2%,98%,1.1",
         "-combine",
         "-colorspace", "sRGB",
+        "-noise", "1",
         "-unsharp", "0x1.5+1+0.002"
     ])
     if output_format in ["webp", "jpg"]:
@@ -793,9 +859,9 @@ def run(args) -> bool:
     for current_filter in detected_filters:
         emit("progress", data={"step": "stacking_started", "filter": current_filter})
 
-        master_dark_path = get_master_dark_path(current_session_dir, files_by_filter[current_filter])
+        master_dark_path = get_master_dark_path(current_session_dir, current_filter)
         master_flat_path = get_master_flat_path(current_session_dir, current_filter)
-        master_bias_path = get_master_bias_path(current_session_dir)
+        master_bias_path = get_master_bias_path(current_session_dir, current_filter)
 
         emit("progress", data={
             "step": "calibration_status",
