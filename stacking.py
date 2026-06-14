@@ -545,9 +545,9 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
     effective_cwd = str(work_dir) if work_dir else str(session_dir)
     debug(f"Check effective_cwd: {effective_cwd}")
 
-    debug(f"=== Script Siril ({script_name}) ===")
+    debug(f"=== Script Siril ({script_name}) Start ===")
     debug(script_content)
-    debug(f"=== Fin du Script ===")
+    debug(f"=== Script end ===")
 
     try:
         process = subprocess.Popen(
