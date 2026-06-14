@@ -39,6 +39,8 @@ VALID_FILTERS = [
     'OIII', 'SII', 'SOLAR', 'CLEAR'
 ]
 
+NARROWBAND_FILTERS = {'HA', 'OIII', 'SII', 'H_BETA', 'HALPHA'}
+
 def debug(message: str):
     if VERBOSE:
         print(f"[DEBUG] {message}", flush=True)
@@ -289,7 +291,6 @@ def get_color_calibration_command(is_color: bool) -> str:
     # Détecte le fond du ciel et balance les blancs de manière itérative et locale
     return ""
 
-NARROWBAND_FILTERS = {'HA', 'OIII', 'SII', 'H_BETA'}
 DENOISE_FRAME_THRESHOLD = 10
 
 def should_apply_denoise(
@@ -365,6 +366,7 @@ def get_rmgreen_command(is_color: bool) -> str:
     Only relevant on color sensors.
     """
     return "rmgreen 0.3" if is_color else ""
+
 # --------------------------------------------------------------------------
 # GENERATE NATIVE SIRIL SCRIPTS (.SSF)
 # --------------------------------------------------------------------------
@@ -384,6 +386,7 @@ def generate_siril_stack_script(
     num_files: used to validate that we have at least 2 images for the stack
     """
     abs_work_dir = filter_work_dir.resolve().as_posix()
+    is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
     bit_cmd = "set32bits" if output_bits == 32 else "set16bits"
 
     lines = [
@@ -403,31 +406,109 @@ def generate_siril_stack_script(
         lines.append(" ".join(cal_cmd))
         seq = "pp_light"
 
-    # 2. Pré-traitement (Dématriçage)
+    # 2. Pre-processing (Debayering)
     if is_color:
         lines.append(f"preprocess {seq} -debayer")
         seq = f"pp_{seq}"
 
-    # 3. Registration & Stack
+    # -------------------------------------------------------------------------
+    # REJECTION METHOD
+    # sigma      < 6 frames  : Winsorized unstable with few data points
+    # winsorized 6–49 frames : good balance robustness/performance
+    # linear     >= 50 frames: Linear Fit Clipping, better on large stacks
+    # -------------------------------------------------------------------------
+    if num_files < 6:
+        rejection = "sigma"
+        sigmas = "3 3"
+    elif num_files >= 50:
+        rejection = "linear"
+        sigmas = "3 3"
+    else:
+        rejection = "winsorized"
+        sigmas = "3 3"
+
+    # -------------------------------------------------------------------------
+    # WEIGHTING
+    # -weight_from_wfwhm   : requires many stars detected by register
+    #                        → reliable on OSC broadband / CLEAR with > 15 frames
+    #                        → unstable on narrowband (few stars, especially SII)
+    # -weight_from_noise   : based on measured background noise
+    #                        → reliable on all filters with clean calibration
+    #                        → can be skewed if few frames and no dark
+    # ""                   : no weighting
+    #                        → short narrowband stack without reliable masters
+    # -----------------------------------------------------------------------
+    if is_color and not is_narrowband and num_files >= 10:
+        # OSC broadband (CLEAR, L) with enough frames: wFWHM reliable
+        weight = "-weight_from_wfwhm"
+    elif any([master_dark_path, master_flat_path, master_bias_path]) and num_files >= 6:
+        # MMono or narrowband calibrated: background noise reliable
+        weight = "-weight_from_noise"
+    else:
+        # Very short stack or without calibration: no weighting
+        weight = ""
+
+    # -------------------------------------------------------------------------
+    # FRAME FILTERING
+    # We combine two complementary criteria:
+    #
+    # -filter-bkg      : excludes frames with sky background too high
+    #                    (cloudy passages, strong gradient) — does not require stars
+    #                    → applicable to all filters including SII
+    #
+    # -filter-wfwhm    : excludes frames with bad seeing (stretched PSF)
+    #                    → requires stars → only broadband / OSC
+    #
+    # -filter-quality  : overall quality score calculated by register
+    #                    → good complement to wfwhm for OSC
+    #
+    # Thresholds in %: we keep the best N% of frames.
+    # Too restrictive (80%) on a small stack → we adapt to the number of frames.
+    # -------------------------------------------------------------------------
+    filters = []
+
+    # Sky background filter: universal, safe even on SII
+    if num_files >= 6:
+        bkg_threshold = "85%" if num_files >= 20 else "90%"
+        filters.append(f"-filter-bkg={bkg_threshold}")
+
+    # wFWHM filter: only if enough stars expected
+    if not is_narrowband and num_files >= 10:
+        wfwhm_threshold = "80%" if num_files >= 30 else "85%"
+        filters.append(f"-filter-wfwhm={wfwhm_threshold}")
+    elif is_narrowband and not (filter_name.upper() == "SII") and num_files >= 10:
+        # HA and OIII still have some stars → more permissive filter
+        filters.append("-filter-wfwhm=90%")
+
+    filter_str = " ".join(filters)
+
+    stackParts = [
+        f"stack r_{seq} rej {rejection} {sigmas}",
+        "-norm=addscale",
+        weight,
+        filter_str
+    ]
+
     lines.extend([
         f'register {seq}',
-        f'stack r_{seq} rej winsorized 3 3 -norm=add -weight_from_noise',
+        " ".join(p for p in stackParts if p),
         f'load r_{seq}_stacked.fit',
     ])
 
+    # 4. Post-processing (linear data, before stretch)
     apply_denoise, denoise_mod = should_apply_denoise(
         filter_name, num_files, is_color,
         all_detected_filters,
         master_dark_path, master_flat_path, master_bias_path
     )
 
-    # 4. Post-processing (linear data, before stretch)
     lines.extend([
         get_subsky_command(master_dark_path, master_flat_path, master_bias_path),
         get_rmgreen_command(is_color),
         f"denoise -da3d -mod={denoise_mod}" if apply_denoise else "",
         "autostretch",
         bit_cmd,
+        "setext fit",
         f'save "../stacked_{filter_name}.fit"',
         "close",
         "exit"
