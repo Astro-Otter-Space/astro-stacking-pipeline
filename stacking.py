@@ -367,6 +367,31 @@ def get_rmgreen_command(is_color: bool) -> str:
     """
     return "rmgreen 0.3" if is_color else ""
 
+def get_stretch_command(
+    filter_name: str,
+    is_color: bool,
+    num_files: int,
+    has_masters: bool
+) -> list[str]:
+    """
+    Returns stretch commands available in Siril 1.2.
+    ght and linstretch are Siril 1.4+ only — not used here.
+    """
+    is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
+
+    # OSC broadband — linked to preserve color balance
+    if is_color and not is_narrowband:
+#         return ["autostretch -linked -2.8 0.25"]
+        return ["autostretch -linked -3.5 0.20"]
+
+    # Short stack or no DOF — brighter targetbg to compensate weak signal
+    if num_files < 6 or not has_masters:
+        return ["autostretch -linked -2.8 0.30"]
+
+    # Narrowband mono — slightly darker background to reveal faint nebulosity
+    # shadowsclip=-2.8 (default), targetbg=0.15 (darker than default 0.25)
+    return ["autostretch -linked -2.8 0.15"]
+
 # --------------------------------------------------------------------------
 # GENERATE NATIVE SIRIL SCRIPTS (.SSF)
 # --------------------------------------------------------------------------
@@ -502,11 +527,17 @@ def generate_siril_stack_script(
         master_dark_path, master_flat_path, master_bias_path
     )
 
+    # 5. Autostretch
+    stretch_cmds = get_stretch_command(
+        filter_name, is_color, num_files,
+        any([master_dark_path, master_flat_path, master_bias_path])
+    )
+
     lines.extend([
         get_subsky_command(master_dark_path, master_flat_path, master_bias_path),
         get_rmgreen_command(is_color),
         f"denoise -da3d -mod={denoise_mod}" if apply_denoise else "",
-        "autostretch",
+        *stretch_cmds,
         bit_cmd,
         "setext fit",
         f'save "../stacked_{filter_name}.fit"',
@@ -670,7 +701,7 @@ def compose_rgb_image(
     cmd.extend([
         "-combine",
         "-colorspace", "sRGB",
-        "-level", "2%,98%,1.1",   # ← après combine : s'applique à l'image RGB entière
+        "-level", "2%,98%,0.9",   # ← après combine : s'applique à l'image RGB entière
         "-noise", "1",
     ])
 
