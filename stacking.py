@@ -575,15 +575,25 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
 # --------------------------------------------------------------------------
 # CHROMINANCE & COMPOSITION VIA IMAGEMAGICK
 # --------------------------------------------------------------------------
-def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, file_prefix: str) -> bool:
-    """Combine normalized TIFF files and handle assembly palettes (LRVB / SHO / HOO / HOO+RGB)."""
+def compose_rgb_image(
+    session_dir: Path,
+    tif_files: dict,
+    output_format: str,
+    file_prefix: str
+) -> bool:
+    """
+    Combine normalized TIFF files into a final RGB image.
+    Supports: Mono, RGB classique, HOO, SHO, SHO+RGB mixé.
+    """
     output_file = session_dir / f"{file_prefix}_full.{output_format}"
 
     # 1. Determine reference geometry for black areas (xc:black)
     ref_path = next(iter(tif_files.values()))
     width, height = get_image_dimensions(ref_path)
 
+    # ------------------------------------------------------------------
     # Single channel (Mono or simple raw extraction)
+    # ------------------------------------------------------------------
     if len(tif_files) == 1:
         single_channel = list(tif_files.values())[0]
         cmd = ["convert", str(single_channel)]
@@ -597,63 +607,88 @@ def compose_rgb_image(session_dir: Path, tif_files: dict, output_format: str, fi
             debug(f"ImageMagick Single Channel Failure: {e}")
             return False
 
-    # --- STEP 1: DETERMINE ASSEMBLY MODE ---
-    cmd = ["convert"]
+    # ------------------------------------------------------------------
+    # DETERMINE ASSEMBLY MODE ---
+    # ------------------------------------------------------------------
+    has_ha   = "HA"    in tif_files
+    has_oiii = "OIII"  in tif_files
+    has_sii  = "SII"   in tif_files
+    has_rgb  = all(k in tif_files for k in ("RED", "GREEN", "BLUE"))
 
-    # Check presence of filter blocks
-    has_ha = "HA" in tif_files
-    has_oiii = "OIII" in tif_files
-    has_sii = "SII" in tif_files
-    has_rgb = "RED" in tif_files and "GREEN" in tif_files and "BLUE" in tif_files
+    def chan(key: str) -> str:
+        """Retourne le chemin du canal ou un canal noir de la bonne taille."""
+        if key in tif_files:
+            return str(tif_files[key])
+        return f"xc:black[{width}x{height}]"   # ← syntaxe correcte pour xc: avec size
 
-    # SPECIAL CASE ONLY: SHO + RGB (Advanced mixing for colored stars)
+    # ------------------------------------------------------------------
+    # PALETTE SHO + RGB : mélange étoiles colorées (80% NB / 20% RGB)
+    # ------------------------------------------------------------------
     if has_sii and has_ha and has_oiii and has_rgb:
-        mix_channels = [
-            (tif_files["SII"], tif_files["RED"]),
-            (tif_files["HA"], tif_files["GREEN"]),
-            (tif_files["OIII"], tif_files["BLUE"])
-        ]
-        for nb_file, rgb_file in mix_channels:
-            cmd.extend(["(", str(nb_file), str(rgb_file), "-blend", "80x20", ")"])
+        debug("Palette: SHO+RGB blend (étoiles colorées)")
+        cmd = ["convert"]
+        for nb_key, rgb_key in [("SII", "RED"), ("HA", "GREEN"), ("OIII", "BLUE")]:
+            cmd.extend(["(", chan(nb_key), chan(rgb_key), "-blend", "80x20", ")"])
+        palette_label = "SHO+RGB"
 
-    # STANDARD CASES (SHO, HOO pure, or classic RGB)
+    # ------------------------------------------------------------------
+    # PALETTE SHO : SII→R, HA→G, OIII→B  (palette Hubble classique)
+    # ------------------------------------------------------------------
+    elif has_sii and has_ha and has_oiii:
+        debug("Palette: SHO (Hubble)")
+        cmd = ["convert", chan("SII"), chan("HA"), chan("OIII")]
+        palette_label = "SHO"
+
+    # ------------------------------------------------------------------
+    # PALETTE HOO : HA→R, OIII→G, OIII→B  (couleurs plus naturelles)
+    # ------------------------------------------------------------------
+    elif has_ha and has_oiii and not has_sii:
+        debug("Palette: HOO")
+        cmd = ["convert", chan("HA"), chan("OIII"), chan("OIII")]
+        palette_label = "HOO"
+
+    # ------------------------------------------------------------------
+    # PALETTE SHα (SII + HA sans OIII) : SII→R, HA→G, noir→B
+    # ------------------------------------------------------------------
+    elif has_sii and has_ha and not has_oiii:
+        debug("Palette: SHα (sans OIII)")
+        cmd = ["convert", chan("SII"), chan("HA"), chan("HA")]  # HA dupliqué en B
+        palette_label = "SHA"
+
+    # ------------------------------------------------------------------
+    # RGB CLASSIQUE (ou tout autre combinaison)
+    # ------------------------------------------------------------------
     else:
-        # Default assignment / classic RGB
-        r_channel = tif_files.get("RED", tif_files.get("HA", "xc:black"))
-        g_channel = tif_files.get("GREEN", tif_files.get("OIII", "xc:black"))
-        b_channel = tif_files.get("BLUE", tif_files.get("SII", "xc:black"))
+        debug("Palette: RGB classique")
+        cmd = ["convert", chan("RED"), chan("GREEN"), chan("BLUE")]
+        palette_label = "RGB"
 
-        # Narrowband palette mapping
-        if has_sii and has_ha and has_oiii:
-            r_channel, g_channel, b_channel = tif_files["SII"], tif_files["HA"], tif_files["OIII"]
-        elif has_ha and has_oiii:
-            r_channel, g_channel, b_channel = tif_files["HA"], tif_files["OIII"], tif_files["OIII"]
-
-        # Add channels to command with dynamic size correction
-        for channel in [r_channel, g_channel, b_channel]:
-            if channel == "xc:black":
-                cmd.extend(["-size", f"{width}x{height}", "xc:black"])
-            else:
-                cmd.append(str(channel))
-
-    # --- STEP 2: FINALIZATION AND EXECUTION ---
+    # ------------------------------------------------------------------
+    # FINALISATION : combine + post-processing + export
+    # Le -level et -combine s'appliquent correctement APRÈS les canaux
+    # ------------------------------------------------------------------
     cmd.extend([
-        "-despeckle",
-        "-level", "2%,98%,1.1",
         "-combine",
         "-colorspace", "sRGB",
+        "-level", "2%,98%,1.1",   # ← après combine : s'applique à l'image RGB entière
         "-noise", "1",
-        "-unsharp", "0x1.5+1+0.002"
     ])
+
     if output_format in ["webp", "jpg"]:
         cmd.extend(["-quality", "95"])
     cmd.append(str(output_file))
 
-    debug(f"Running ImageMagick chrominance synthesis: {' '.join(cmd)}")
+    debug(f"ImageMagick [{palette_label}]: {' '.join(str(c) for c in cmd)}")
+
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
         if result.returncode != 0:
-            debug(f"ImageMagick STDERR Error: {result.stderr}")
+            debug(f"ImageMagick STDERR: {result.stderr}")
         return result.returncode == 0
     except Exception as e:
         debug(f"ImageMagick composite assembly failure: {e}")
