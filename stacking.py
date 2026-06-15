@@ -54,7 +54,7 @@ def emit(status: str, data: dict = None, params: dict = None):
     print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
 
 # --------------------------------------------------------------------------
-# FONCTIONS DE PIPELINE (Renommées)
+# PIPELINE FUNCTIONS
 # --------------------------------------------------------------------------
 def get_fits_header(fits_path: Path) -> dict:
     """Cache FITS header reads to avoid redundant file operations."""
@@ -72,7 +72,7 @@ def is_color_camera(fits_path: Path) -> bool:
         debug(f"⚠️ No headers FITS, default MONO")
         return False
 
-    debug(f"=== Détection Capteur ===")
+    debug(f"=== Sensor Detection ===")
     debug(f"  INSTRUME: {header.get('INSTRUME', 'N/A')}")
     debug(f"  BAYERPAT: {header.get('BAYERPAT', 'N/A')}")
     debug(f"  XBAYROFF: {header.get('XBAYROFF', 'N/A')}")
@@ -96,8 +96,8 @@ def is_color_camera(fits_path: Path) -> bool:
 
 def get_fits_bitdepth(fits_path: Path) -> int:
     """
-    Détecte la profondeur de bits via BITPIX du header FITS.
-    BITPIX=16 → 16-bit entier signé
+    Detects bit depth via BITPIX from FITS header.
+    BITPIX=16 → 16-bit signed integer
     BITPIX=-32 → float32, BITPIX=-64 → float64 → 32-bit
     """
     try:
@@ -107,7 +107,7 @@ def get_fits_bitdepth(fits_path: Path) -> int:
             debug(f"BITPIX={bitpix} → {detected}-bit")
             return detected
     except Exception as e:
-        debug(f"Impossible de lire le bit depth de {fits_path}: {e}")
+        debug(f"Unable to read bit depth from {fits_path}: {e}")
         return 32
 
 # --------------------------------------------------------------------------
@@ -132,9 +132,9 @@ def ensure_2d_master(master_path: Path) -> Path | None:
             header = hdul[0].header.copy()
             data = hdul[0].data
             original_dtype = data.dtype
-        # Si l'image a été lue ou sauvée par erreur en RGB (3D)
+        # If image was accidentally read or saved as RGB (3D)
         if data.ndim == 3:
-            data = np.mean(data, axis=-1).astype(original_dtype)  # Fusion propre en intensité pure
+            data = np.mean(data, axis=-1).astype(original_dtype)  # Clean merge to pure intensity
             header.add_comment('Master normalized to 2D structure')
         elif data.ndim != 2:
             debug(f"Invalid image structure for calibration: {data.ndim} dimensions")
@@ -183,7 +183,7 @@ def _find_master_dof(
         )
         return matches[0] if matches else None
 
-    # 1. Filter-specific (4 variantes de casse)
+    # 1. Filter-specific (4 case variants)
     if filter_name:
         variants = {filter_name, filter_name.upper(), filter_name.lower(), filter_name.capitalize()}
         for variant in variants:
@@ -218,6 +218,7 @@ def get_master_bias_path(session_dir: Path, filter_name: str | None = None) -> s
     """Look for a master bias. Filter-specific first, then generic master_bias.
     Note: bias are usually filter-independent, but filter-specific ones are supported."""
     return _find_master_dof(session_dir / "bias", "master_bias", filter_name)
+
 # --------------------------------------------------------------------------
 # SUBSKY - Gradient Optimization
 # --------------------------------------------------------------------------
@@ -303,51 +304,51 @@ def should_apply_denoise(
     master_bias_path: str = None,
 ) -> tuple[bool, float]:
     """
-    Détermine automatiquement si denoise doit être appliqué et avec quel mod.
-    Retourne (apply: bool, mod: float).
+    Automatically determines if denoise should be applied and with what mod.
+    Returns (apply: bool, mod: float).
 
-    Règles d'exclusion (prioritaires) :
-    - Caméra couleur OSC → désactivé (déséquilibre inter-canal garanti)
-    - Palette multi-filtre (SHO/HOO) → désactivé (mod différent par filtre = cast coloré)
+    Exclusion rules (priority):
+    - Color OSC camera → disabled (inter-channel imbalance guaranteed)
+    - Multi-filter palette (SHO/HOO) → disabled (different mod per filter = color cast)
 
-    Règles d'activation :
-    - Narrowband mono + stack court → activé
-    - Narrowband mono + DOF manquants → activé
-    - Stack très court (< 5) quelle que soit la config mono → activé
+    Activation rules:
+    - Narrowband mono + short stack → enabled
+    - Narrowband mono + missing DOF → enabled
+    - Very short stack (< 5) regardless of mono config → enabled
 
-    Le mod s'adapte à la qualité de calibration disponible.
+    The mod adapts to the available calibration quality.
     """
 
-    # --- EXCLUSIONS PRIORITAIRES ---
+    # --- PRIORITY EXCLUSIONS ---
 
-    # Caméra couleur : jamais — le denoise par canal OSC crée un déséquilibre
+    # Color camera: never — OSC channel denoise creates imbalance
     if is_color:
-        debug(f"Denoise [{filter_name}]: OFF — caméra couleur OSC")
+        debug(f"Denoise [{filter_name}]: OFF — multi-filter palette {active_narrowband}")
         return False, 0.0
 
-    # Palette multi-filtre narrowband : jamais — cause observée de la dominante verte
+    # Multi-filter narrowband palette: never — observed cause of green cast
     active_narrowband = [f for f in all_detected_filters if f in NARROWBAND_FILTERS]
     if len(active_narrowband) > 1:
         debug(f"Denoise [{filter_name}]: OFF — palette multi-filtre {active_narrowband}")
         return False, 0.0
 
-    # --- CALCUL DU MOD selon qualité de calibration ---
+    # --- MOD CALCULATION based on calibration quality ---
     has_dark = bool(master_dark_path)
     has_flat = bool(master_flat_path)
     has_bias = bool(master_bias_path)
     dof_count = sum([has_dark, has_flat, has_bias])
 
-    # Plus on a de DOF, moins le bruit résiduel est élevé → mod plus faible
+    # More DOF available, less residual noise → lower mod
     if dof_count == 3:
-        mod = 0.4   # Calibration complète — touche légère
+        mod = 0.4  # Complete calibration — light touch
     elif dof_count == 2:
         mod = 0.55
     elif dof_count == 1:
-        mod = 0.7   # Valeur de référence
+        mod = 0.7 # Reference value
     else:
-        mod = 0.85  # Aucun DOF — plus agressif
+        mod = 0.85 # No DOF — more aggressive
 
-    # --- CONDITIONS D'ACTIVATION ---
+    # --- ACTIVATION CONDITIONS ---
     is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
     is_short_stack = num_files < DENOISE_FRAME_THRESHOLD
     is_very_short = num_files < 5
@@ -614,7 +615,7 @@ def compose_rgb_image(
 ) -> bool:
     """
     Combine normalized TIFF files into a final RGB image.
-    Supports: Mono, RGB classique, HOO, SHO, SHO+RGB mixé.
+    Supports: Mono, RGB classic, HOO, SHO, SHO+RGB mixed.
     """
     output_file = session_dir / f"{file_prefix}_full.{output_format}"
 
@@ -647,23 +648,23 @@ def compose_rgb_image(
     has_rgb  = all(k in tif_files for k in ("RED", "GREEN", "BLUE"))
 
     def chan(key: str) -> str:
-        """Retourne le chemin du canal ou un canal noir de la bonne taille."""
+        """Returns the channel path or a black channel of the correct size."""
         if key in tif_files:
             return str(tif_files[key])
-        return f"xc:black[{width}x{height}]"   # ← syntaxe correcte pour xc: avec size
+        return f"xc:black[{width}x{height}]"
 
     # ------------------------------------------------------------------
-    # PALETTE SHO + RGB : mélange étoiles colorées (80% NB / 20% RGB)
+    # SHO + RGB PALETTE : blend color stars (80% NB / 20% RGB)
     # ------------------------------------------------------------------
     if has_sii and has_ha and has_oiii and has_rgb:
-        debug("Palette: SHO+RGB blend (étoiles colorées)")
+        debug("Palette: SHO+RGB blend (color stars)")
         cmd = ["convert"]
         for nb_key, rgb_key in [("SII", "RED"), ("HA", "GREEN"), ("OIII", "BLUE")]:
             cmd.extend(["(", chan(nb_key), chan(rgb_key), "-blend", "80x20", ")"])
         palette_label = "SHO+RGB"
 
     # ------------------------------------------------------------------
-    # PALETTE SHO : SII→R, HA→G, OIII→B  (palette Hubble classique)
+    # SHO PALETTE : SII→R, HA→G, OIII→B  (classic Hubble palette)
     # ------------------------------------------------------------------
     elif has_sii and has_ha and has_oiii:
         debug("Palette: SHO (Hubble)")
@@ -671,7 +672,7 @@ def compose_rgb_image(
         palette_label = "SHO"
 
     # ------------------------------------------------------------------
-    # PALETTE HOO : HA→R, OIII→G, OIII→B  (couleurs plus naturelles)
+    # HOO PALETTE : HA→R, OIII→G, OIII→B  (more natural colors)
     # ------------------------------------------------------------------
     elif has_ha and has_oiii and not has_sii:
         debug("Palette: HOO")
@@ -679,29 +680,29 @@ def compose_rgb_image(
         palette_label = "HOO"
 
     # ------------------------------------------------------------------
-    # PALETTE SHα (SII + HA sans OIII) : SII→R, HA→G, noir→B
+    # SHα PALETTE (SII + HA without OIII) : SII→R, HA→G, black→B
     # ------------------------------------------------------------------
     elif has_sii and has_ha and not has_oiii:
-        debug("Palette: SHα (sans OIII)")
+        debug("Palette: SHα (without OIII)")
         cmd = ["convert", chan("SII"), chan("HA"), chan("HA")]  # HA dupliqué en B
         palette_label = "SHA"
 
     # ------------------------------------------------------------------
-    # RGB CLASSIQUE (ou tout autre combinaison)
+    # CLASSIC RGB (or any other combination)
     # ------------------------------------------------------------------
     else:
-        debug("Palette: RGB classique")
+        debug("Palette: classic RGB")
         cmd = ["convert", chan("RED"), chan("GREEN"), chan("BLUE")]
         palette_label = "RGB"
 
     # ------------------------------------------------------------------
-    # FINALISATION : combine + post-processing + export
-    # Le -level et -combine s'appliquent correctement APRÈS les canaux
+    # FINALIZATION : combine + post-processing + export
+    # The -level and -combine apply correctly AFTER the channels
     # ------------------------------------------------------------------
     cmd.extend([
         "-combine",
         "-colorspace", "sRGB",
-        "-level", "2%,98%,0.9",   # ← après combine : s'applique à l'image RGB entière
+        "-level", "2%,98%,0.9",   # ← after combine: applies to entire RGB image
         "-noise", "1",
     ])
 
@@ -766,7 +767,7 @@ def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Pa
             f.write(f'save "{output_aligned.as_posix()}"\n')
         f.write('close\n')
 
-    # Exécution unique
+    # Single execution
     cmd = ["siril-cli", "-s", str(script_path)]
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -809,21 +810,21 @@ def cleanup_session(session_dir: Path):
     """Clean all temporary files, including converted masters and gradient residuals."""
     temp_patterns = [
         "*.tmp", "*.log", "*.pid", "*.lock", "*.txt",
-        "work_*/",           # Répertoires de travail
-#        "stacked_*.fit",     # Masters empilés
-        "stacked_*.tif",     # Masters convertis en TIFF
-        "r_pp_*.fit",        # Séquences calibrées
-        "pp_*.fit",          # Pré-calibration
-        "r_light_*.fit",     # Lights alignés
-        "light_*.fit",       # Lights convertis
-        "master_*_2d.fit",   # ✅ Modèles de gradient résiduels générés par subsky
-        "*.ssf"              # Scripts Siril temporaires
+        "work_*/",           # Working directories
+    #        "stacked_*.fit",     # Stacked masters
+        "stacked_*.tif",     # Masters converted to TIFF
+        "r_pp_*.fit",        # Calibrated sequences
+        "pp_*.fit",          # Pre-calibration
+        "r_light_*.fit",     # Aligned lights
+        "light_*.fit",       # Converted lights
+        "master_*_2d.fit",   # ✅ Residual gradient models generated by subsky
+        "*.ssf"              # Temporary Siril scripts
     ]
 
     import glob
     import shutil
 
-    # Nettoyer dans le répertoire principal et les sous-dossiers DOF
+    # Clean in main directory and DOF subdirectories
     base_dirs = [
         session_dir,
         session_dir / "darks",
@@ -980,7 +981,6 @@ def run(args) -> bool:
 
         num_files = 0
         for i, src_file in enumerate(sorted(files_by_filter[current_filter]), start=1):
-#             clean_name = src_file.name.replace(" ", "_")
             dst_name = f"light{i:05d}.fit"
             dst_file = filter_work_dir / dst_name
             if dst_file.exists() or dst_file.is_symlink():
