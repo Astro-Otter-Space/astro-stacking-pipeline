@@ -40,6 +40,8 @@ VALID_FILTERS = [
 ]
 
 NARROWBAND_FILTERS = {'HA', 'OIII', 'SII', 'H_BETA', 'HALPHA'}
+BROADBAND_FILTERS = {'RED', 'GREEN', 'BLUE', 'CLEAR', 'LUMINANCE', 'L', 'R', 'G', 'B'}
+
 
 def debug(message: str):
     if VERBOSE:
@@ -193,12 +195,31 @@ def _find_master_dof(
                     debug(f"Filter-specific {generic_name} found: {match.name}")
                     return resolve_master(match)
 
-    # 2. Generic fallback : master_dark.fit / master_flat.fit / master_bias.fit
+    # 2. Generic fallback : case variants of generic_name
+    # Supports: master_dark, master-dark, masterDark, MasterDark, masterdark...
+    base = generic_name.replace("master_", "")  # "dark", "flat", "bias"
+    generic_variants = [
+        f"master_{base}",           # master_dark   (snake_case)
+        f"master-{base}",           # master-dark   (kebab-case)
+        f"Master_{base}",           # Master_dark
+        f"master{base}",            # masterdark    (lowercase)
+        f"master{base.capitalize()}",   # masterDark    (camelCase)
+        f"Master{base.capitalize()}",   # MasterDark
+    ]
+
     for ext in ('.fit', '.fits'):
-        generic = dof_dir / f"{generic_name}{ext}"
-        if generic.exists():
-            debug(f"Generic {generic_name} found: {generic.name}")
-            return resolve_master(generic)
+        for variant in generic_variants:
+            # Exact match first
+            exact = dof_dir / f"{variant}{ext}"
+            if exact.exists() and not exact.stem.endswith("_2d"):
+                debug(f"Generic {generic_name} found (exact): {exact.name}")
+                return resolve_master(exact)
+
+            # Glob with suffixes (e.g. masterDark_BIN-1_4656x3520_EXPOSURE-300.00s.fit)
+            match = find_by_pattern(f"{variant}*{ext}")
+            if match:
+                debug(f"Generic {generic_name} found (glob): {match.name}")
+                return resolve_master(match)
 
     debug(f"No {generic_name} found in {dof_dir}")
     return None
@@ -320,6 +341,7 @@ def should_apply_denoise(
     """
 
     # --- PRIORITY EXCLUSIONS ---
+    active_narrowband = [f for f in all_detected_filters if f in NARROWBAND_FILTERS]
 
     # Color camera: never — OSC channel denoise creates imbalance
     if is_color:
@@ -327,7 +349,6 @@ def should_apply_denoise(
         return False, 0.0
 
     # Multi-filter narrowband palette: never — observed cause of green cast
-    active_narrowband = [f for f in all_detected_filters if f in NARROWBAND_FILTERS]
     if len(active_narrowband) > 1:
         debug(f"Denoise [{filter_name}]: OFF — palette multi-filtre {active_narrowband}")
         return False, 0.0
@@ -377,20 +398,40 @@ def get_stretch_command(
     """
     Returns stretch commands available in Siril 1.2.
     ght and linstretch are Siril 1.4+ only — not used here.
+
+    Strategy:
+    - OSC broadband (CLEAR, L, RGB)  → autostretch -linked -3.5 0.20
+      Aggressive shadowsclip to reveal faint nebulosity on color sensor.
+    - Mono broadband (R, G, B, CLEAR) → autostretch -linked -2.8 0.25
+      Standard stretch, preserve color balance across RGB channels.
+    - Mono narrowband, short stack    → autostretch -linked -2.8 0.30
+      Brighter targetbg to compensate weak signal / few frames.
+    - Mono narrowband, standard       → autostretch -linked -2.8 0.15
+      Darker background to reveal faint nebulosity.
     """
     is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
+    is_broadband  = filter_name.upper() in BROADBAND_FILTERS
 
-    # OSC broadband — linked to preserve color balance
-    if is_color and not is_narrowband:
-#         return ["autostretch -linked -2.8 0.25"]
-        return ["autostretch -linked -3.5 0.20"]
+    if is_color:
+        if is_narrowband:
+            # OSC + narrowband filter (e.g. Ha clip on color camera)
+            # Treat like mono narrowband — narrower signal range
+            return ["autostretch -linked -2.8 0.15"]
+        else:
+            # OSC broadband (CLEAR, no filter)
+            return ["autostretch -linked -3.5 0.20"]
 
-    # Short stack or no DOF — brighter targetbg to compensate weak signal
+    # --- Mono camera ---
+    if is_broadband:
+        # Mono RGB/CLEAR/L — standard broadband stretch
+        return ["autostretch -linked -2.8 0.25"]
+
+    # Mono narrowband (HA, OIII, SII, H_BETA...)
     if num_files < 6 or not has_masters:
+        # Short stack or no calibration — compensate weak signal
         return ["autostretch -linked -2.8 0.30"]
 
-    # Narrowband mono — slightly darker background to reveal faint nebulosity
-    # shadowsclip=-2.8 (default), targetbg=0.15 (darker than default 0.25)
+    # Standard mono narrowband
     return ["autostretch -linked -2.8 0.15"]
 
 # --------------------------------------------------------------------------
@@ -699,12 +740,18 @@ def compose_rgb_image(
     # FINALIZATION : combine + post-processing + export
     # The -level and -combine apply correctly AFTER the channels
     # ------------------------------------------------------------------
+    gamma = "1.1" if palette_label == "RGB" else "0.9"
     cmd.extend([
         "-combine",
         "-colorspace", "sRGB",
-        "-level", "2%,98%,0.9",   # ← after combine: applies to entire RGB image
-        "-noise", "1",
+        "-level", f"2%,98%,{gamma}",   # ← after combine: applies to entire RGB image
     ])
+
+    if palette_label not in ("RGB", "SHA"):
+        cmd.extend(["-noise", "1"])
+
+    if palette_label == "RGB":
+        cmd.extend(["-unsharp", "0x0.8+0.5+0.001"])
 
     if output_format in ["webp", "jpg"]:
         cmd.extend(["-quality", "95"])
