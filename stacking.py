@@ -41,6 +41,7 @@ VALID_FILTERS = [
 
 NARROWBAND_FILTERS = {'HA', 'OIII', 'SII', 'HALPHA', 'H_BETA'}
 BROADBAND_FILTERS = {'RED', 'GREEN', 'BLUE', 'CLEAR', 'LUMINANCE', 'L', 'R', 'G', 'B'}
+VERBOSE = False
 
 def debug(message: str):
     if VERBOSE:
@@ -48,7 +49,6 @@ def debug(message: str):
 
 def emit(status: str, data: dict = None, params: dict = None):
     """Emit a JSON message to stderr for IPC with Symfony API."""
-    import json
     payload = {"status": status}
     if data: payload["data"] = data
     if params: payload["params"] = params
@@ -289,14 +289,14 @@ def get_subsky_command(
         emit("progress", data={"degree": degree,"tolerance": tolerance, "smooth": smooth, "samples": samples})
         return f'{base_cmd} {degree} -tolerance={tolerance} -smooth={smooth} -samples={samples}'
 
-def get_color_calibration_command(is_color: bool) -> str:
-    """
-    Generate the best possible color calibration command.
-    If PCC is possible and requested, use it. Otherwise, fallback to local 'cc'.
-    """
-    if not is_color:
-        return ""
-
+# def get_color_calibration_command(is_color: bool) -> str:
+#     """
+#     Generate the best possible color calibration command.
+#     If PCC is possible and requested, use it. Otherwise, fallback to local 'cc'.
+#     """
+#     if not is_color:
+#         return ""
+#
     # SaaS Premium Mode: Attempt PCC if we have an object and valid files
 #     if light_files and dso_name.lower() not in ["unknown", ""]:
 #         try:
@@ -310,10 +310,10 @@ def get_color_calibration_command(is_color: bool) -> str:
 #                     return f"pcc -cc={dso_name.upper()} -focal={int(focal)} -pixel={float(pixel_size)} -server=simbad"
 #         except Exception as e:
 #             debug(f"Incomplete metadata for PCC ({e}), falling back to local calibration.")
-
+#
     # LOCAL FALLBACK: Standard color calibration (Siril 1.2)
     # Detects sky background and balances whites iteratively and locally
-    return ""
+#     return ""
 
 DENOISE_FRAME_THRESHOLD = 10
 
@@ -552,7 +552,7 @@ def generate_siril_stack_script(
 
     filter_str = " ".join(filters)
 
-    stackParts = [
+    stack_parts = [
         f"stack r_{seq} rej {rejection} {sigmas}",
         "-norm=addscale",
         weight,
@@ -561,7 +561,7 @@ def generate_siril_stack_script(
 
     lines.extend([
         f'register {seq}',
-        " ".join(p for p in stackParts if p),
+        " ".join(p for p in stack_parts if p),
         f'load r_{seq}_stacked.fit',
     ])
 
@@ -590,7 +590,7 @@ def generate_siril_stack_script(
         "exit"
     ])
 
-    return "\n".join(lines)
+    return "\n".join(line for line in lines if line)
 
 def generate_siril_script(session_dir: Path, filter_name: str, file_prefix: str) -> str:
     """
@@ -751,14 +751,15 @@ def compose_rgb_image(
         "-combine",
         "-colorspace", "sRGB",
         "-level", f"2%,98%,{gamma}",   # ← after combine: applies to entire RGB image
+        "-morphology", "Erode", "Disk:0.5" # <- Reduces the radius of the stars by ~0.5px
     ])
 
     if palette_label not in ("RGB", "SHA"):
         cmd.extend(["-noise", "1"])
 
     if palette_label == "RGB":
-        cmd.extend(["-unsharp", "0x0.8+0.5+0.001"])
-
+        #  cmd.extend(["-unsharp", "0x0.8+0.5+0.001"])
+        cmd.extend(["-unsharp", "0x1.2+0.8+0.05"])
     if output_format in ["webp", "jpg"]:
         cmd.extend(["-quality", "95"])
     cmd.append(str(output_file))
@@ -874,9 +875,6 @@ def cleanup_session(session_dir: Path):
         "*.ssf"              # Temporary Siril scripts
     ]
 
-    import glob
-    import shutil
-
     # Clean in main directory and DOF subdirectories
     base_dirs = [
         session_dir,
@@ -911,7 +909,7 @@ def run(args) -> bool:
     dso_name = re.sub(r'[^a-zA-Z0-9_-]', '', args.dso.lower().replace(" ", ""))
 
     first_light = None
-    for f in lights_dir.iterdir():
+    for f in sorted(lights_dir.iterdir()):
         if f.is_file() and f.suffix.lower() in ['.fits', '.fit', '.fts']:
             first_light = f
             break
@@ -924,11 +922,10 @@ def run(args) -> bool:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     file_prefix = f"{dso_name}_{timestamp}"
 
-    cleanup_session(current_session_dir)
-
     if not lights_dir.is_dir():
         emit("error", params={"detail": "Lights directory not found"})
         return False
+    cleanup_session(current_session_dir)
 
     # 1. Sort and index files by detected filter
     emit("progress", data={"step": "start", "message": f"Processing started for {dso_name}"})
@@ -968,8 +965,11 @@ def run(args) -> bool:
 
                     filter_keyword = filter_keyword.replace(' ', '').replace('-', '_')
 
-                    if filter_keyword in filter_map:
-                        matched_filter = filter_map[filter_keyword]
+                    filter_map_normalized = {
+                        k.replace(' ', '').replace('-', '_'): v
+                        for k, v in filter_map.items()
+                    }
+                    matched_filter = filter_map_normalized.get(filter_keyword)
             except Exception as e:
                 debug(f"Failed to read FITS header: {f.name} -> {matched_filter} (original: {header.get('FILTER', 'N/A')}) / {e}")
 
@@ -1085,28 +1085,16 @@ def run(args) -> bool:
             continue
 
         emit("progress", data={"step": "stacking_done", "filter": current_filter})
-        if filter_work_dir.is_dir():
-            shutil.rmtree(filter_work_dir)
-
         siril_default_fit = current_session_dir / f"stacked_{current_filter}.fit"
         custom_fit_name = current_session_dir / f"{file_prefix}_{current_filter}.fit"
-    
+
         if siril_default_fit.is_file():
             if custom_fit_name.exists():
                 custom_fit_name.unlink()
             siril_default_fit.rename(custom_fit_name)
             master_files_map[current_filter] = custom_fit_name
         else:
-            # Safety: If Siril named it differently (e.g., without prefix or already with custom name)
-            fallback_fit = current_session_dir / f"{file_prefix}_{current_filter}.fit"
-            if fallback_fit.is_file():
-                master_files_map[current_filter] = fallback_fit
-            else:
-                # If the file remained in the work subdirectory
-                work_fit = current_session_dir / f"work_{current_filter}" / f"stacked_{current_filter}.fit"
-                if work_fit.is_file():
-                    shutil.move(work_fit, custom_fit_name)
-                    master_files_map[current_filter] = custom_fit_name
+            debug(f"⚠️ stacked_{current_filter}.fit not found after stacking")
 
         if filter_work_dir.is_dir():
             shutil.rmtree(filter_work_dir)
@@ -1182,7 +1170,6 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", "-v", action="store_true", help="Display debug log")
 
     args = parser.parse_args()
-    global VERBOSE
     VERBOSE = args.verbose
 
     try:
