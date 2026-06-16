@@ -39,9 +39,8 @@ VALID_FILTERS = [
     'OIII', 'SII', 'SOLAR', 'CLEAR'
 ]
 
-NARROWBAND_FILTERS = {'HA', 'OIII', 'SII', 'H_BETA', 'HALPHA'}
+NARROWBAND_FILTERS = {'HA', 'OIII', 'SII', 'HALPHA', 'H_BETA'}
 BROADBAND_FILTERS = {'RED', 'GREEN', 'BLUE', 'CLEAR', 'LUMINANCE', 'L', 'R', 'G', 'B'}
-
 
 def debug(message: str):
     if VERBOSE:
@@ -71,7 +70,7 @@ def is_color_camera(fits_path: Path) -> bool:
     """Analyze FITS header to determine if sensor is color (OSC)."""
     header = get_fits_header(fits_path)
     if not header:
-        debug(f"⚠️ No headers FITS, default MONO")
+        debug(f"⚠️ No FITS headers, default MONO")
         return False
 
     debug(f"=== Sensor Detection ===")
@@ -133,6 +132,9 @@ def ensure_2d_master(master_path: Path) -> Path | None:
         with fits.open(master_path) as hdul:
             header = hdul[0].header.copy()
             data = hdul[0].data
+            if data is None:
+                debug(f"Empty data in {master_path.name}, skipping 2D normalization")
+                return None
             original_dtype = data.dtype
         # If image was accidentally read or saved as RGB (3D)
         if data.ndim == 3:
@@ -295,7 +297,7 @@ def get_color_calibration_command(is_color: bool) -> str:
     if not is_color:
         return ""
 
-    # Mode SaaS Premium : Tentative de PCC si on a un objet et des fichiers valides
+    # SaaS Premium Mode: Attempt PCC if we have an object and valid files
 #     if light_files and dso_name.lower() not in ["unknown", ""]:
 #         try:
 #             with fits.open(light_files[0], mode='readonly', ignore_missing_end=True) as hdul:
@@ -304,13 +306,13 @@ def get_color_calibration_command(is_color: bool) -> str:
 #                 pixel_size = header.get('XPIXSZ') or header.get('PIXSIZE')
 #
 #                 if focal and pixel_size:
-#                     # Étalonnage par Photométrie (Optionnel et conditionnel)
+#                     # Photometric Calibration (Optional and conditional)
 #                     return f"pcc -cc={dso_name.upper()} -focal={int(focal)} -pixel={float(pixel_size)} -server=simbad"
 #         except Exception as e:
-#             debug(f"Métadonnées incomplètes pour le PCC ({e}), bascule sur l'étalonnage local.")
+#             debug(f"Incomplete metadata for PCC ({e}), falling back to local calibration.")
 
-    # FALLBACK LOCAL : Étalonnage des couleurs standard (Siril 1.2)
-    # Détecte le fond du ciel et balance les blancs de manière itérative et locale
+    # LOCAL FALLBACK: Standard color calibration (Siril 1.2)
+    # Detects sky background and balances whites iteratively and locally
     return ""
 
 DENOISE_FRAME_THRESHOLD = 10
@@ -341,16 +343,16 @@ def should_apply_denoise(
     """
 
     # --- PRIORITY EXCLUSIONS ---
-    active_narrowband = [f for f in all_detected_filters if f in NARROWBAND_FILTERS]
 
     # Color camera: never — OSC channel denoise creates imbalance
     if is_color:
-        debug(f"Denoise [{filter_name}]: OFF — multi-filter palette {active_narrowband}")
+        debug(f"Denoise [{filter_name}]: OFF — color OSC camera")
         return False, 0.0
 
     # Multi-filter narrowband palette: never — observed cause of green cast
+    active_narrowband = [f for f in all_detected_filters if f in NARROWBAND_FILTERS]
     if len(active_narrowband) > 1:
-        debug(f"Denoise [{filter_name}]: OFF — palette multi-filtre {active_narrowband}")
+        debug(f"Denoise [{filter_name}]: OFF — multi-filter palette {active_narrowband}")
         return False, 0.0
 
     # --- MOD CALCULATION based on calibration quality ---
@@ -361,13 +363,13 @@ def should_apply_denoise(
 
     # More DOF available, less residual noise → lower mod
     if dof_count == 3:
-        mod = 0.4  # Complete calibration — light touch
+        mod = 0.4   # Complete calibration — light touch
     elif dof_count == 2:
         mod = 0.55
     elif dof_count == 1:
-        mod = 0.7 # Reference value
+        mod = 0.7   # Reference value
     else:
-        mod = 0.85 # No DOF — more aggressive
+        mod = 0.85  # No DOF — more aggressive
 
     # --- ACTIVATION CONDITIONS ---
     is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
@@ -431,7 +433,8 @@ def get_stretch_command(
         # Short stack or no calibration — compensate weak signal
         return ["autostretch -linked -2.8 0.30"]
 
-    # Standard mono narrowband
+    # Narrowband mono — slightly darker background to reveal faint nebulosity
+    # shadowsclip=-2.8 (default), targetbg=0.15 (darker than default 0.25)
     return ["autostretch -linked -2.8 0.15"]
 
 # --------------------------------------------------------------------------
@@ -509,7 +512,7 @@ def generate_siril_stack_script(
         # OSC broadband (CLEAR, L) with enough frames: wFWHM reliable
         weight = "-weight_from_wfwhm"
     elif any([master_dark_path, master_flat_path, master_bias_path]) and num_files >= 6:
-        # MMono or narrowband calibrated: background noise reliable
+        # Mono or narrowband calibrated: background noise reliable
         weight = "-weight_from_noise"
     else:
         # Very short stack or without calibration: no weighting
@@ -725,7 +728,7 @@ def compose_rgb_image(
     # ------------------------------------------------------------------
     elif has_sii and has_ha and not has_oiii:
         debug("Palette: SHα (without OIII)")
-        cmd = ["convert", chan("SII"), chan("HA"), chan("HA")]  # HA dupliqué en B
+        cmd = ["convert", chan("SII"), chan("HA"), chan("HA")]  # HA duplicated in B
         palette_label = "SHA"
 
     # ------------------------------------------------------------------
@@ -733,6 +736,9 @@ def compose_rgb_image(
     # ------------------------------------------------------------------
     else:
         debug("Palette: classic RGB")
+        missing_channels = [k for k in ("RED", "GREEN", "BLUE") if k not in tif_files]
+        if missing_channels:
+            debug(f"WARNING: Missing RGB channels {missing_channels}, filling with black.")
         cmd = ["convert", chan("RED"), chan("GREEN"), chan("BLUE")]
         palette_label = "RGB"
 
@@ -777,9 +783,9 @@ def get_image_dimensions(ref_path: Path) -> tuple:
     """Get real dimensions of the master FITS for ImageMagick."""
     try:
         with Image.open(ref_path) as img:
-            return img.size # Retourne (width, height)
+            return img.size # Returns (width, height)
     except Exception:
-        # Fallback de secours si PIL échoue
+        # Fallback if PIL fails
         debug(f"Warning: Could not read dimensions of {ref_path}, fallback 2048x2048")
         return (2048, 2048)
 
@@ -858,7 +864,7 @@ def cleanup_session(session_dir: Path):
     temp_patterns = [
         "*.tmp", "*.log", "*.pid", "*.lock", "*.txt",
         "work_*/",           # Working directories
-    #        "stacked_*.fit",     # Stacked masters
+#        "stacked_*.fit",     # Stacked masters
         "stacked_*.tif",     # Masters converted to TIFF
         "r_pp_*.fit",        # Calibrated sequences
         "pp_*.fit",          # Pre-calibration
@@ -1066,10 +1072,11 @@ def run(args) -> bool:
 
         stacked_file = current_session_dir / f"stacked_{current_filter}.fit"
         if stacked_file.exists():
-            debug(f"✅ Stacked file found: {stacked_file.name} ({stacked_file.stat().st_size} bytes)")
+            size_kb = stacked_file.stat().st_size / 1024
+            debug(f"✅ Stacked file found: {stacked_file.name} ({size_kb:.1f} KB)")
         else:
             debug(f"❌ Missed stacked file: {stacked_file.name}")
-            success = False  # ✅ Forcer l'échec si pas de fichier
+            success = False  # ✅ Force failure if no file
 
         if not success:
             emit("error", data={"step": "stacking_failed", "filter": current_filter})
@@ -1083,7 +1090,7 @@ def run(args) -> bool:
 
         siril_default_fit = current_session_dir / f"stacked_{current_filter}.fit"
         custom_fit_name = current_session_dir / f"{file_prefix}_{current_filter}.fit"
-        
+    
         if siril_default_fit.is_file():
             if custom_fit_name.exists():
                 custom_fit_name.unlink()
@@ -1106,7 +1113,7 @@ def run(args) -> bool:
 
     # 4. Crucial step: Global cross-filter alignment
     if len(master_files_map) > 1:
-        emit("progress", data={"step": "inter_filter_alignment_started", "message": "Recalage géométrique global..."})
+        emit("progress", data={"step": "inter_filter_alignment_started", "message": "Global geometric alignment..."})
         ref_candidate = master_files_map.get('HA') or list(master_files_map.values())[0]
 
         # Define list of files to align
@@ -1183,6 +1190,6 @@ if __name__ == "__main__":
         if not success:
             sys.exit(1)
     except Exception as e:
-        print(f"[CRITICAL] Rupture du runner de traitement : {e}")
+        print(f"[CRITICAL] Processing runner failure : {e}")
         traceback.print_exc()
         sys.exit(1)
