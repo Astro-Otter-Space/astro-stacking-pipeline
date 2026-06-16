@@ -817,7 +817,7 @@ def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Pa
                 continue
             output_aligned = img.parent / f"{img.stem}_aligned.fit"
             f.write(f'load "{ref_image.as_posix()}"\n')
-            f.write(f'register "{img.as_posix()}"\n')
+            f.write(f'register "{img.as_posix()}" -2pass\n')
             f.write(f'save "{output_aligned.as_posix()}"\n')
         f.write('close\n')
 
