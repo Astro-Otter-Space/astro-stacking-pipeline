@@ -42,6 +42,7 @@ VALID_FILTERS = [
 NARROWBAND_FILTERS = {'HA', 'OIII', 'SII', 'HALPHA', 'H_BETA'}
 BROADBAND_FILTERS = {'RED', 'GREEN', 'BLUE', 'CLEAR', 'LUMINANCE', 'L', 'R', 'G', 'B'}
 VERBOSE = False
+VALID_EXTENSIONS = {'.fits', '.fit', '.fts', '.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}
 
 def debug(message: str):
     if VERBOSE:
@@ -68,6 +69,10 @@ def get_fits_header(fits_path: Path) -> dict:
 
 def is_color_camera(fits_path: Path) -> bool:
     """Analyze FITS header to determine if sensor is color (OSC)."""
+    if fits_path.suffix.lower() in {'.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}:
+        debug(f"RAW file detected ({fits_path.suffix}) → color camera assumed")
+        return True
+
     header = get_fits_header(fits_path)
     if not header:
         debug(f"⚠️ No FITS headers, default MONO")
@@ -101,6 +106,11 @@ def get_fits_bitdepth(fits_path: Path) -> int:
     BITPIX=16 → 16-bit signed integer
     BITPIX=-32 → float32, BITPIX=-64 → float64 → 32-bit
     """
+    # RAW files → Siril converts to 16-bit FITS
+    if fits_path.suffix.lower() in {'.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}:
+        debug(f"RAW file → assuming 16-bit output after Siril conversion")
+        return 16
+
     try:
         with fits.open(fits_path, mode='readonly', ignore_missing_end=True) as hdul:
             bitpix = hdul[0].header.get('BITPIX', -32)
@@ -118,6 +128,10 @@ def ensure_2d_master(master_path: Path) -> Path | None:
     """Ensure the master is in the correct 2D FITS geometric format (Mono or CFA) for Siril CLI."""
     if not master_path.exists():
         return None
+
+    if master_path.suffix.lower() not in ('.fit', '.fits', '.fts'):
+        debug(f"Non-FITS master, skipping 2D check: {master_path.name}")
+        return master_path
 
     output_path = master_path.parent / f"{master_path.stem}_2d.fit"
 
@@ -161,7 +175,10 @@ def _find_master_dof(
 ) -> str | None:
     """
     Generic DOF master finder (dark, flat, bias).
-    Prioritizes filter-specific master, then generic master_{type}.
+    Priority order:
+      1. Filter-specific master (e.g. masterDark_FILTER-HA.fit)
+      2. Generic master variants (master_dark, masterDark, MasterDark...)
+      3. On-the-fly stacking of individual frames if no master found
     Excludes _2d files (already processed intermediates).
     Matches case variants: HA / Ha / ha / Ha (capitalize).
     Returns the most recently modified match.
@@ -191,7 +208,7 @@ def _find_master_dof(
     if filter_name:
         variants = {filter_name, filter_name.upper(), filter_name.lower(), filter_name.capitalize()}
         for variant in variants:
-            for ext in ('.fit', '.fits'):
+            for ext in VALID_EXTENSIONS:
                 match = find_by_pattern(f"*FILTER-{variant}*{ext}")
                 if match:
                     debug(f"Filter-specific {generic_name} found: {match.name}")
@@ -201,15 +218,15 @@ def _find_master_dof(
     # Supports: master_dark, master-dark, masterDark, MasterDark, masterdark...
     base = generic_name.replace("master_", "")  # "dark", "flat", "bias"
     generic_variants = [
-        f"master_{base}",           # master_dark   (snake_case)
-        f"master-{base}",           # master-dark   (kebab-case)
-        f"Master_{base}",           # Master_dark
-        f"master{base}",            # masterdark    (lowercase)
+        f"master_{base}",               # master_dark   (snake_case)
+        f"master-{base}",               # master-dark   (kebab-case)
+        f"Master_{base}",               # Master_dark
+        f"master{base}",                # masterdark    (lowercase)
         f"master{base.capitalize()}",   # masterDark    (camelCase)
         f"Master{base.capitalize()}",   # MasterDark
     ]
 
-    for ext in ('.fit', '.fits'):
+    for ext in VALID_EXTENSIONS:
         for variant in generic_variants:
             # Exact match first
             exact = dof_dir / f"{variant}{ext}"
@@ -223,9 +240,66 @@ def _find_master_dof(
                 debug(f"Generic {generic_name} found (glob): {match.name}")
                 return resolve_master(match)
 
-    debug(f"No {generic_name} found in {dof_dir}")
-    return None
+    # 3. Fallback : individual frames → stack on-the-fly
+    # Triggered when no pre-built master found but raw frames exist in the directory
+    raw_frames = sorted([
+        f for f in dof_dir.iterdir()
+        if f.is_file()
+        and f.suffix.lower() in VALID_EXTENSIONS
+        and not f.stem.endswith("_2d")
+        and not f.name.lower().startswith("master")
+    ])
 
+    if not raw_frames:
+        debug(f"No {generic_name} found in {dof_dir}")
+        return None
+
+    dof_type = generic_name.replace("master_", "")   # "dark" | "flat" | "bias"
+    debug(f"No pre-built {generic_name} — stacking {len(raw_frames)} individual frames on-the-fly")
+
+
+    # Create a temp work subdir to isolate symlinks from originals
+    work_subdir = dof_dir / f"work_{dof_type}"
+    work_subdir.mkdir(exist_ok=True)
+
+    for i, frame in enumerate(raw_frames, start=1):
+        dst = work_subdir / f"{dof_type}_{i:05d}{frame.suffix.lower()}"
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        try:
+            dst.symlink_to(frame.resolve())
+        except OSError:
+            shutil.copy(frame, dst)
+
+    norm = {"dark": "-nonorm", "bias": "-nonorm", "flat": "-norm=mul"}.get(dof_type, "-nonorm")
+    master_output = dof_dir / f"master_{dof_type}.fit"
+
+    script = "\n".join([
+        "requires 1.2.0",
+        f'cd "{work_subdir.resolve().as_posix()}"',
+        f'convert {dof_type}',
+        f'stack {dof_type} rej winsorized 3 3 {norm} -out=../master_{dof_type}',
+        "close",
+        "exit"
+    ])
+
+    # run_siril_command needs a session_dir for the temp .ssf file
+    session_dir = dof_dir.parent
+    success = run_siril_command(
+        session_dir,
+        script,
+        f"dof_{dof_type}.ssf",
+        work_dir=work_subdir
+    )
+
+    if success and master_output.exists():
+        debug(f"✅ master_{dof_type}.fit generated ({len(raw_frames)} frames stacked)")
+        # Cleanup work subdir
+        shutil.rmtree(work_subdir, ignore_errors=True)
+        return resolve_master(master_output)
+
+    debug(f"⚠️ On-the-fly {dof_type} stacking failed — proceeding without master")
+    return None
 
 def get_master_dark_path(session_dir: Path, filter_name: str | None = None) -> str | None:
     """Look for a master dark. Filter-specific first, then generic master_dark."""
@@ -910,7 +984,7 @@ def run(args) -> bool:
 
     first_light = None
     for f in sorted(lights_dir.iterdir()):
-        if f.is_file() and f.suffix.lower() in ['.fits', '.fit', '.fts']:
+        if f.is_file() and f.suffix.lower() in VALID_EXTENSIONS:
             first_light = f
             break
     output_bits = 32
@@ -933,7 +1007,7 @@ def run(args) -> bool:
 
     files_by_filter = {}
     for f in lights_dir.iterdir():
-        if f.is_file() and f.suffix.lower() in ['.fits', '.fit', '.fts']:
+        if f.is_file() and f.suffix.lower() in VALID_EXTENSIONS:
             matched_filter = None
 
             # Step 1: Try to read filter from FITS header
@@ -971,7 +1045,7 @@ def run(args) -> bool:
                     }
                     matched_filter = filter_map_normalized.get(filter_keyword)
             except Exception as e:
-                debug(f"Failed to read FITS header: {f.name} -> {matched_filter} (original: {header.get('FILTER', 'N/A')}) / {e}")
+                debug(f"Failed to read FITS header: {f.name} ({type(e).__name__}: {e})")
 
             # Step 2: If step 1 failed or no valid filter found, try with filename
             if matched_filter is None:
@@ -1034,7 +1108,10 @@ def run(args) -> bool:
 
         num_files = 0
         for i, src_file in enumerate(sorted(files_by_filter[current_filter]), start=1):
-            dst_name = f"light{i:05d}.fit"
+            FITS_EXTENSIONS = {'.fits', '.fit', '.fts'}
+            src_ext = src_file.suffix.lower()
+            dst_ext = ".fit" if src_ext in FITS_EXTENSIONS else src_ext
+            dst_name = f"light{i:05d}{dst_ext}"
             dst_file = filter_work_dir / dst_name
             if dst_file.exists() or dst_file.is_symlink():
                 dst_file.unlink()
@@ -1063,12 +1140,9 @@ def run(args) -> bool:
             work_dir=filter_work_dir
         )
 
-        debug(f"=== Files in {filter_work_dir} ===")
-        for f in filter_work_dir.glob("*.fit"):
-            debug(f"  FITS: {f.name}")
-        for f in filter_work_dir.glob("*.seq"):
-            debug(f"  SEQ: {f.name}")
-        debug(f"============================")
+        fits_count = len(list(filter_work_dir.glob("*.fit")))
+        seq_count  = len(list(filter_work_dir.glob("*.seq")))
+        debug(f"=== work_{current_filter}: {fits_count} FITS, {seq_count} SEQ ===")
 
         stacked_file = current_session_dir / f"stacked_{current_filter}.fit"
         if stacked_file.exists():
