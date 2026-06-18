@@ -820,11 +820,10 @@ def compose_rgb_image(
     # FINALIZATION : combine + post-processing + export
     # The -level and -combine apply correctly AFTER the channels
     # ------------------------------------------------------------------
-    gamma = "1.1" if palette_label == "RGB" else "0.9"
     cmd.extend([
         "-combine",
         "-colorspace", "sRGB",
-        "-level", f"2%,98%,{gamma}",   # ← after combine: applies to entire RGB image
+        "-level", f"2%,98%,0.9",
         "-morphology", "Erode", "Disk:0.5" # <- Reduces the radius of the stars by ~0.5px
     ])
 
