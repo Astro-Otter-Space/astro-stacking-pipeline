@@ -354,40 +354,37 @@ def get_subsky_command(
         base_cmd = 'subsky'
         degree = 3
         if nb_missing == 1:
-            tolerance, smooth, samples = 1.4, 0.70, 60
+            tolerance, samples = 1.4, 60
         elif nb_missing == 2:
-           tolerance, smooth, samples, degree = 1.8, 0.5, 65, 2
+          tolerance, samples, degree = 1.6, 65, 2
         else:
-            tolerance, smooth, samples = 1.6, 0.85, 70
+            tolerance, samples, degree = 1.3, 80, 2
 
-        emit("progress", data={"degree": degree,"tolerance": tolerance, "smooth": smooth, "samples": samples})
-        return f'{base_cmd} {degree} -tolerance={tolerance} -smooth={smooth} -samples={samples}'
+        emit("progress", data={"degree": degree, "tolerance": tolerance, "samples": samples})
+        return f'{base_cmd} {degree} -tolerance={tolerance} -samples={samples}'
 
-# def get_color_calibration_command(is_color: bool) -> str:
-#     """
-#     Generate the best possible color calibration command.
-#     If PCC is possible and requested, use it. Otherwise, fallback to local 'cc'.
-#     """
-#     if not is_color:
-#         return ""
-#
-    # SaaS Premium Mode: Attempt PCC if we have an object and valid files
-#     if light_files and dso_name.lower() not in ["unknown", ""]:
-#         try:
-#             with fits.open(light_files[0], mode='readonly', ignore_missing_end=True) as hdul:
-#                 header = hdul[0].header
-#                 focal = header.get('FOCALLEN')
-#                 pixel_size = header.get('XPIXSZ') or header.get('PIXSIZE')
-#
-#                 if focal and pixel_size:
-#                     # Photometric Calibration (Optional and conditional)
-#                     return f"pcc -cc={dso_name.upper()} -focal={int(focal)} -pixel={float(pixel_size)} -server=simbad"
-#         except Exception as e:
-#             debug(f"Incomplete metadata for PCC ({e}), falling back to local calibration.")
-#
-    # LOCAL FALLBACK: Standard color calibration (Siril 1.2)
-    # Detects sky background and balances whites iteratively and locally
-#     return ""
+def get_color_calibration_command(
+    is_color: bool,
+    dso_name: str,
+    light_files: list,
+) -> str:
+    if not is_color:
+        return ""
+
+    # Tentative PCC si DSO connu et métadonnées disponibles
+    if dso_name and dso_name not in ("unknown", ""):
+        try:
+            with fits.open(light_files[0], mode='readonly', ignore_missing_end=True) as hdul:
+                h = hdul[0].header
+                focal = h.get('FOCALLEN')
+                pixel_size = h.get('XPIXSZ') or h.get('PIXSIZE')
+                if focal and pixel_size:
+                    return f"pcc -cc={dso_name.upper()} -focal={int(focal)} -pixel={float(pixel_size)}"
+        except Exception as e:
+            debug(f"PCC impossible ({e}), fallback cc")
+
+    # Fallback : calibration locale standard Siril 1.2
+    return "cc -nostellar"
 
 DENOISE_FRAME_THRESHOLD = 10
 
@@ -654,6 +651,7 @@ def generate_siril_stack_script(
 
     lines.extend([
         get_subsky_command(master_dark_path, master_flat_path, master_bias_path),
+#         get_color_calibration_command(is_color, '', ),
         get_rmgreen_command(is_color),
         f"denoise -da3d -mod={denoise_mod}" if apply_denoise else "",
         *stretch_cmds,
@@ -760,9 +758,9 @@ def compose_rgb_image(
     # ------------------------------------------------------------------
     # DETERMINE ASSEMBLY MODE ---
     # ------------------------------------------------------------------
-    has_ha   = "HA"    in tif_files
-    has_oiii = "OIII"  in tif_files
-    has_sii  = "SII"   in tif_files
+    has_ha   = "HA"   in tif_files
+    has_oiii = "OIII" in tif_files
+    has_sii  = "SII"  in tif_files
     has_rgb  = all(k in tif_files for k in ("RED", "GREEN", "BLUE"))
 
     def chan(key: str) -> str:
@@ -771,6 +769,16 @@ def compose_rgb_image(
             return str(tif_files[key])
         return f"xc:black[{width}x{height}]"
 
+    def blend_cmd(img_a: str, img_b: str, pct_a: int) -> list:
+        """Blend two images: pct_a% of img_a + (100-pct_a)% of img_b."""
+        return [
+            "(", img_a, img_b,
+            "-define", f"compose:args={pct_a},{100 - pct_a}",
+            "-compose", "Blend",
+            "-composite",
+            ")",
+        ]
+
     # ------------------------------------------------------------------
     # SHO + RGB PALETTE : blend color stars (80% NB / 20% RGB)
     # ------------------------------------------------------------------
@@ -778,7 +786,7 @@ def compose_rgb_image(
         debug("Palette: SHO+RGB blend (color stars)")
         cmd = ["convert"]
         for nb_key, rgb_key in [("SII", "RED"), ("HA", "GREEN"), ("OIII", "BLUE")]:
-            cmd.extend(["(", chan(nb_key), chan(rgb_key), "-blend", "80x20", ")"])
+            cmd.extend(blend_cmd(chan(nb_key), chan(rgb_key), 80))
         palette_label = "SHO+RGB"
 
     # ------------------------------------------------------------------
@@ -794,16 +802,44 @@ def compose_rgb_image(
     # ------------------------------------------------------------------
     elif has_ha and has_oiii and not has_sii:
         debug("Palette: HOO")
-        cmd = ["convert", chan("HA"), chan("OIII"), chan("OIII")]
+        cmd = ["convert",
+            chan("HA"),
+            *blend_cmd(chan("HA"), chan("OIII"), 30),  # G = 30% HA + 70% OIII
+            chan("OIII"),
+        ]
         palette_label = "HOO"
 
     # ------------------------------------------------------------------
     # SHα PALETTE (SII + HA without OIII) : SII→R, HA→G, black→B
     # ------------------------------------------------------------------
     elif has_sii and has_ha and not has_oiii:
-        debug("Palette: SHα (without OIII)")
-        cmd = ["convert", chan("SII"), chan("HA"), chan("HA")]  # HA duplicated in B
+        debug("Palette: SHA (without OIII)")
+        if has_rgb:
+            # Best: SII→R, HA→G, BLUE channel
+            debug("  Using SHA with RGB blue channel")
+            cmd = ["convert", chan("SII"), chan("HA"), chan("BLUE")]
+        else:
+            # Fallback: SII→R, HA→G, HA (darkened for B)
+            debug("  SHA fallback: HA duplicated with reduced intensity")
+            cmd = [
+                "convert",
+                chan("SII"),
+                chan("HA"),
+                f"{chan('HA')} -modulate 100,50,80"
+            ]
         palette_label = "SHA"
+
+    # ------------------------------------------------------------------
+    # HaRGB PALETTE (todo)
+    # ------------------------------------------------------------------
+    elif has_ha and has_rgb:
+        debug("Palette: HaRGB")
+        cmd = ["convert",
+            *blend_cmd(chan("HA"), chan("RED"), 60),  # R = 60% HA + 40% RED
+            chan("GREEN"),
+            chan("BLUE"),
+        ]
+        palette_label = "HaRGB"
 
     # ------------------------------------------------------------------
     # CLASSIC RGB (or any other combination)
@@ -823,29 +859,42 @@ def compose_rgb_image(
     cmd.extend([
         "-combine",
         "-colorspace", "sRGB",
-        "-level", f"2%,98%,0.9",
-        "-morphology", "Erode", "Disk:0.5" # <- Reduces the radius of the stars by ~0.5px
+        # "-morphology", "Erode", "Disk:0.5",
     ])
 
-    if palette_label not in ("RGB", "SHA"):
-        cmd.extend(["-noise", "1"])
+    if palette_label in ("SHO", "HOO", "SHO+RGB", "SHA"):
+        # For narrowband palettes, use gentle level + tone curve
+        cmd.extend([
+            "-level", "0.5%,99.5%",
+            "-sigmoidal-contrast", "2x50%",
+            "-modulate", "100,130",
+            "-unsharp", "0.5x1.0+0.02+0.01",
+        ])
+    elif palette_label == "RGB":
+        cmd.extend([
+            "-level", "1%,98%",
+            "-sigmoidal-contrast", "4x50%",
+            "-unsharp", "0x1.2+0.8+0.05",
+        ])
+    else:
+        cmd.extend(["-level", "2%,98%"])
+
+    if palette_label in ("SHO", "HOO", "SHO+RGB"):
+        cmd.extend(["-modulate", "100,135"])
+        cmd.extend(["-unsharp", "0.5x1.0+0.02+0.01"])
 
     if palette_label == "RGB":
-        #  cmd.extend(["-unsharp", "0x0.8+0.5+0.001"])
         cmd.extend(["-unsharp", "0x1.2+0.8+0.05"])
+
     if output_format in ["webp", "jpg"]:
         cmd.extend(["-quality", "95"])
+
     cmd.append(str(output_file))
 
     debug(f"ImageMagick [{palette_label}]: {' '.join(str(c) for c in cmd)}")
 
     try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0:
             debug(f"ImageMagick STDERR: {result.stderr}")
         return result.returncode == 0
