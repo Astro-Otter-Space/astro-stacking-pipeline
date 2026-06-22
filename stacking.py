@@ -469,44 +469,95 @@ def get_stretch_command(
     has_masters: bool
 ) -> list[str]:
     """
-    Returns stretch commands available in Siril 1.2.
+    Returns autostretch commands for Siril 1.2.
     ght and linstretch are Siril 1.4+ only — not used here.
 
-    Strategy:
-    - OSC broadband (CLEAR, L, RGB)  → autostretch -linked -3.5 0.20
-      Aggressive shadowsclip to reveal faint nebulosity on color sensor.
-    - Mono broadband (R, G, B, CLEAR) → autostretch -linked -2.8 0.25
-      Standard stretch, preserve color balance across RGB channels.
-    - Mono narrowband, short stack    → autostretch -linked -2.8 0.30
-      Brighter targetbg to compensate weak signal / few frames.
-    - Mono narrowband, standard       → autostretch -linked -2.8 0.15
-      Darker background to reveal faint nebulosity.
-    """
-    is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
-    is_broadband  = filter_name.upper() in BROADBAND_FILTERS
+    Core principle: targetbg scales inversely with signal quality.
+    Better SNR (more frames + calibration masters) → lower targetbg
+    (darker background, more dynamic range).
+    Weaker SNR → higher targetbg to avoid clipping faint signal.
 
+    shadowsclip controls how aggressively dark noise is clipped before stretch:
+      -2.8 → standard, preserves faint diffuse nebulosity
+      -3.0 → moderate, good balance on well-calibrated data
+      -3.5 → aggressive, clips more noise but risks losing faint structures
+
+    Parameter matrix:
+    ┌─────────────────────────┬─────────────┬──────────┐
+    │ Case                    │ shadowsclip │ targetbg │
+    ├─────────────────────────┼─────────────┼──────────┤
+    │ OSC broadband, many     │ -3.0        │ 0.20     │
+    │ OSC broadband, medium   │ -2.8        │ 0.23     │
+    │ OSC broadband, short    │ -2.8        │ 0.28     │
+    │ OSC narrowband          │ -2.8        │ 0.15     │
+    │ Mono RGB channel        │ -2.8        │ 0.25     │
+    │ Mono broadband (CLEAR/L)│ -2.8        │ 0.25     │
+    │ Mono NB, well calibrated│ -2.8        │ 0.15     │
+    │ Mono NB, medium         │ -2.8        │ 0.20     │
+    │ Mono NB, short/no DOF   │ -2.8        │ 0.28     │
+    └─────────────────────────┴─────────────┴──────────┘
+    """
+    is_narrowband  = filter_name.upper() in NARROWBAND_FILTERS
+    is_rgb_channel = filter_name.upper() in {"RED", "GREEN", "BLUE"}
+    is_broadband   = filter_name.upper() in BROADBAND_FILTERS
+
+    # Signal quality score — drives targetbg selection
+    good_stack  = num_files >= 20 and has_masters
+    medium_stack = num_files >= 8  and has_masters
+    short_stack  = num_files < 6   or not has_masters
+
+    # ------------------------------------------------------------------
+    # OSC COLOR CAMERA
+    # -linked is mandatory to preserve color balance.
+    # shadowsclip is relaxed on short stacks to avoid clipping diffuse
+    # nebulosity that would otherwise be indistinguishable from noise.
+    # ------------------------------------------------------------------
     if is_color:
         if is_narrowband:
-            # OSC + narrowband filter (e.g. Ha clip on color camera)
-            # Treat like mono narrowband — narrower signal range
+            # OSC + narrowband clip (e.g. dual-band filter on color camera)
+            # Signal is narrow-band but sensor is color — treat like mono NB
             return ["autostretch -linked -2.8 0.15"]
-        else:
-            # OSC broadband (CLEAR, no filter)
-            return ["autostretch -linked -3.5 0.20"]
 
-    # --- Mono camera ---
-    if is_broadband:
-        # Mono RGB/CLEAR/L — standard broadband stretch
+        # OSC broadband (CLEAR, no filter, UHC, CLS...)
+        if good_stack:
+            # Enough frames to trust SNR — aggressive clip, dark background
+            return ["autostretch -linked -3.0 0.20"]
+        elif medium_stack:
+            # Moderate stack — balance between noise rejection and signal preservation
+            return ["autostretch -linked -2.8 0.23"]
+        else:
+            # Short stack or no calibration — softer clip, brighter targetbg
+            # Avoids clipping diffuse nebulosity (M16, M42, M31 outer halos)
+            return ["autostretch -linked -2.8 0.28"]
+
+    # ------------------------------------------------------------------
+    # MONO CAMERA — RGB individual channels
+    # Must use identical parameters across R/G/B to preserve color balance
+    # when channels are later combined by compose_rgb_image.
+    # ------------------------------------------------------------------
+    if is_rgb_channel:
         return ["autostretch -linked -2.8 0.25"]
 
-    # Mono narrowband (HA, OIII, SII, H_BETA...)
-    if num_files < 6 or not has_masters:
-        # Short stack or no calibration — compensate weak signal
-        return ["autostretch -linked -2.8 0.30"]
+    # ------------------------------------------------------------------
+    # MONO CAMERA — broadband (CLEAR, L, LUMINANCE)
+    # ------------------------------------------------------------------
+    if is_broadband:
+        return ["autostretch -linked -2.8 0.25"]
 
-    # Narrowband mono — slightly darker background to reveal faint nebulosity
-    # shadowsclip=-2.8 (default), targetbg=0.15 (darker than default 0.25)
-    return ["autostretch -linked -2.8 0.15"]
+    # ------------------------------------------------------------------
+    # MONO CAMERA — narrowband (HA, OIII, SII, H_BETA)
+    # targetbg adapts to stack quality: darker bg when SNR is reliable,
+    # brighter when signal may be weak or noise is not well-calibrated.
+    # ------------------------------------------------------------------
+    if good_stack:
+        # Well-calibrated deep stack — push background dark to reveal faint filaments
+        return ["autostretch -linked -2.8 0.15"]
+    elif medium_stack:
+        # Decent stack — moderate background
+        return ["autostretch -linked -2.8 0.20"]
+    else:
+        # Short stack or missing masters — bright targetbg to avoid clipping signal
+        return ["autostretch -linked -2.8 0.28"]
 
 # --------------------------------------------------------------------------
 # GENERATE NATIVE SIRIL SCRIPTS (.SSF)
