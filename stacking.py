@@ -664,17 +664,23 @@ def generate_siril_stack_script(
 
     return "\n".join(line for line in lines if line)
 
-def generate_siril_script(session_dir: Path, filter_name: str, file_prefix: str) -> str:
+def generate_siril_script(
+    session_dir: Path,
+    filter_name: str,
+    file_prefix: str,
+    fit_path: Path = None
+) -> str:
     """
     Generate the intermediate FIT to TIFF conversion script.
     Uses the native 'savetif' command from Siril 1.2 to avoid erroneous hybrid files like '.tif.fit'.
     """
-    fit_path = (session_dir / f"{file_prefix}_{filter_name}.fit").as_posix()
+    if fit_path is None:
+        fit_path = session_dir / f"{file_prefix}_{filter_name}.fit"
     tif_path = (session_dir / f"{file_prefix}_{filter_name}").as_posix()
 
     return "\n".join([
         "requires 1.2.0",
-        f'load "{fit_path}"',
+        f'load "{fit_path.as_posix()}"',
         f'savetif "{tif_path}"',
         "close",
         "exit"
@@ -915,16 +921,16 @@ def compose_rgb_image(
     if palette_label in ("SHO", "SHO+RGB"):
         cmd.extend([
             "-level", "0.5%,99.5%",
-            "-sigmoidal-contrast", "2x50%", # "3x45%",
+            "-sigmoidal-contrast", "3x45%",
             "-modulate", "100,135",
             "-unsharp", "0.5x1.0+0.5+0.01",
         ])
-
+        cmd.extend(["-channel", "Green", "-level", "0%,95%", "+channel"])
     elif palette_label == "HOO":
         cmd.extend([
             "-level", "0.5%,99.5%",
-            "-sigmoidal-contrast", "3x45%",
-            "-modulate", "100,125",
+            "-sigmoidal-contrast", "4x45%",
+            "-modulate", "100,145",
             "-unsharp", "0.5x1.0+0.5+0.01",
         ])
 
@@ -1071,7 +1077,7 @@ def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Pa
             script = "\n".join([
                 "requires 1.2.0",
                 f'cd "{src_dir.as_posix()}"',
-                f'convert align -out="{work_dir.as_posix()}"',
+                "convert align -out=..",
                 f'cd "{work_dir.as_posix()}"',
                 "register align",
                 'load "r_align_00002.fit"',
@@ -1391,7 +1397,12 @@ def run(args) -> bool:
     for current_filter, final_fit_path in master_files_map.items():
         debug(f"Finalized linear master TIFF extraction : {current_filter}")
         # Temporarily go through the final tree to generate conversion .ssf
-        conv_script = generate_siril_script(current_session_dir, current_filter, file_prefix)
+        conv_script = generate_siril_script(
+            current_session_dir,
+            current_filter,
+            file_prefix,
+            fit_path=final_fit_path
+        )
         run_siril_command(current_session_dir, conv_script, f"conv_{current_filter}.ssf")
 
     # 6. Mapping of generated TIFF files
