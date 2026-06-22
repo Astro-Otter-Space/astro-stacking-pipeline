@@ -106,7 +106,7 @@ def get_fits_bitdepth(fits_path: Path) -> int:
     BITPIX=16 → 16-bit signed integer
     BITPIX=-32 → float32, BITPIX=-64 → float64 → 32-bit
     """
-    # RAW files → Siril converts to 16-bit FITS
+    # RAW files → Siril conve'rts to 16-bit FITS
     if fits_path.suffix.lower() in {'.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}:
         debug(f"RAW file → assuming 16-bit output after Siril conversion")
         return 16
@@ -924,33 +924,59 @@ def correct_image_orientation(image_path: Path):
 # --------------------------------------------------------------------------
 def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Path = None) -> bool:
     """
-    Properly align images to a reference via a single .ssf script.
+    Aligne chaque master FITS sur la référence via une séquence artificielle à 2 frames.
+    Siril 1.2 ne dispose pas de coregister — on crée une séquence [ref, cible]
+    et on récupère r_align_00002.fit comme résultat aligné.
     """
     if not images_to_align or not ref_image:
         return False
 
-    # Prepare the script file to be executed in a single Siril instance
-    script_path = session_dir / "inter_filter_align.ssf"
+    all_ok = True
 
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write(f'cd "{session_dir.as_posix()}"\n')
-        for img in images_to_align:
-            if img == ref_image:
-                continue
+    for img in images_to_align:
+        if img == ref_image:
+            continue
+
+        # Répertoire de travail isolé pour cette paire
+        work_dir = session_dir / f"_align_work_{img.stem}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Créer la séquence artificielle : ref=00001, cible=00002
+            for dst, src in [
+                (work_dir / "align_00001.fit", ref_image),
+                (work_dir / "align_00002.fit", img),
+            ]:
+                if dst.exists() or dst.is_symlink():
+                    dst.unlink()
+                try:
+                    dst.symlink_to(src.resolve())
+                except OSError:
+                    shutil.copy(src, dst)
+
             output_aligned = img.parent / f"{img.stem}_aligned.fit"
-            f.write(f'load "{ref_image.as_posix()}"\n')
-            f.write(f'register "{img.as_posix()}" -2pass\n')
-            f.write(f'save "{output_aligned.as_posix()}"\n')
-        f.write('close\n')
 
-    # Single execution
-    cmd = ["siril-cli", "-s", str(script_path)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+            script = "\n".join([
+                "requires 1.2.0",
+                f'cd "{work_dir.as_posix()}"',
+                "convert align -out=.",
+                "register align",
+                f'load "r_align_00002.fit"',
+                f'save "{output_aligned.as_posix()}"',
+                "close",
+                "exit"
+            ])
 
-    if script_path.exists():
-        script_path.unlink()
+            success = run_siril_command(session_dir, script, f"align_{img.stem}.ssf")
 
-    return result.returncode == 0
+            if not success or not output_aligned.exists():
+                debug(f"⚠️ Alignment failed for {img.name}")
+                all_ok = False
+
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    return all_ok
 
 # --------------------------------------------------------------------------
 # IMAGE ALIGNMENT WITH ASTROALIGN (NOT CALLED)
