@@ -876,6 +876,7 @@ def compose_rgb_image(
         cmd = ["convert", chan("RED"), chan("GREEN"), chan("BLUE")]
         palette_label = "RGB"
 
+    emit("progress", data={"step": "combine", "message": f"Selected palette: {palette_label}"})
     # ------------------------------------------------------------------
     # FINALIZATION — combine channels then apply palette-specific
     # post-processing: level clip, tone curve, saturation, sharpening.
@@ -947,7 +948,7 @@ def compose_rgb_image(
         cmd.extend([
             "-level", "1%,98%",
             "-sigmoidal-contrast", "4x50%",
-            "-unsharp", "0x1.2+0.8+0.05",
+            "-unsharp", "0x1.0+0.5+0.02",
         ])
 
     else:
@@ -997,9 +998,40 @@ def correct_image_orientation(image_path: Path):
 # --------------------------------------------------------------------------
 def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Path = None) -> bool:
     """
-    Aligne chaque master FITS sur la référence via une séquence artificielle à 2 frames.
-    Siril 1.2 ne dispose pas de coregister — on crée une séquence [ref, cible]
-    et on récupère r_align_00002.fit comme résultat aligné.
+    Align each master FITS to a common reference using Siril's register command.
+
+    Siril 1.2 does not support coregister (single-image alignment). The workaround
+    is to build an artificial 2-frame sequence [reference, target] per pair, run
+    register on it, then extract r_align_00002.fit as the aligned result.
+
+    Root cause of the previous failure: calling `convert align -out=.` when
+    the source files (align_00001.fit, align_00002.fit) are IN the same directory
+    as the output causes Siril to overwrite the input files during conversion.
+    cfitsio then fails to open the corrupted/empty file on the subsequent `register`.
+
+    Fix: source files are placed in a `src/` subdirectory, while the `convert`
+    output is directed to the parent work directory via an absolute -out= path.
+    This completely eliminates the read/write filename collision.
+
+    Directory layout per channel pair:
+        _align_work_{stem}/
+            src/
+                align_00001.fit  ← reference copy (input only)
+                align_00002.fit  ← target copy    (input only)
+            align_00001.fit      ← written by `convert align -out=work_dir`
+            align_00002.fit      ← written by `convert align -out=work_dir`
+            align_.seq           ← written by `convert`
+            r_align_00002.fit    ← written by `register` (aligned result)
+
+    Args:
+        session_dir:      Root session directory, used to write the .ssf script.
+        images_to_align:  List of master FITS files to align onto the reference.
+        ref_image:        Reference FITS frame (typically HA or the first stacked channel).
+
+    Returns:
+        True if all alignments succeeded, False if any channel failed.
+        On failure, the original (unaligned) files remain in master_files_map
+        and the pipeline continues without inter-filter alignment.
     """
     if not images_to_align or not ref_image:
         return False
@@ -1010,43 +1042,62 @@ def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Pa
         if img == ref_image:
             continue
 
-        # Répertoire de travail isolé pour cette paire
         work_dir = session_dir / f"_align_work_{img.stem}"
-        work_dir.mkdir(parents=True, exist_ok=True)
+        src_dir  = work_dir / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Créer la séquence artificielle : ref=00001, cible=00002
+            # Copy both frames into src/ subdirectory.
+            # convert will read from src/ and write to work_dir/ → no filename collision.
             for dst, src in [
-                (work_dir / "align_00001.fit", ref_image),
-                (work_dir / "align_00002.fit", img),
+                (src_dir / "align_00001.fit", ref_image),   # frame 0 = reference
+                (src_dir / "align_00002.fit", img),          # frame 1 = target
             ]:
-                if dst.exists() or dst.is_symlink():
+                if dst.exists():
                     dst.unlink()
-                try:
-                    dst.symlink_to(src.resolve())
-                except OSError:
-                    shutil.copy(src, dst)
+                shutil.copy2(src, dst)
 
             output_aligned = img.parent / f"{img.stem}_aligned.fit"
 
+            # Script flow:
+            #   1. cd src/        → Siril working dir points to the source files
+            #   2. convert align  → reads src/align_0000*.fit,
+            #                       writes converted FITS + align_.seq to work_dir/
+            #                       (absolute -out avoids any relative-path ambiguity)
+            #   3. cd work_dir/   → switch to the directory holding the converted files
+            #   4. register align → reads align_.seq, aligns frame 1 onto frame 0,
+            #                       writes r_align_00001.fit and r_align_00002.fit
+            #   5. load/save      → extract the aligned target to the session directory
             script = "\n".join([
                 "requires 1.2.0",
+                f'cd "{src_dir.as_posix()}"',
+                f'convert align -out="{work_dir.as_posix()}"',
                 f'cd "{work_dir.as_posix()}"',
-                "convert align -out=.",
                 "register align",
-                f'load "r_align_00002.fit"',
+                'load "r_align_00002.fit"',
                 f'save "{output_aligned.as_posix()}"',
                 "close",
-                "exit"
+                "exit",
             ])
 
-            success = run_siril_command(session_dir, script, f"align_{img.stem}.ssf")
+            success = run_siril_command(
+                session_dir,
+                script,
+                f"align_{img.stem}.ssf"
+            )
 
             if not success or not output_aligned.exists():
                 debug(f"⚠️ Alignment failed for {img.name}")
                 all_ok = False
+            else:
+                debug(f"✅ Aligned: {img.name} → {output_aligned.name}")
+
+        except Exception as e:
+            debug(f"❌ Unexpected error aligning {img.name}: {e}")
+            all_ok = False
 
         finally:
+            # Always remove the work directory, even on failure
             shutil.rmtree(work_dir, ignore_errors=True)
 
     return all_ok
