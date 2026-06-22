@@ -730,17 +730,30 @@ def compose_rgb_image(
     file_prefix: str
 ) -> bool:
     """
-    Combine normalized TIFF files into a final RGB image.
-    Supports: Mono, RGB classic, HOO, SHO, SHO+RGB mixed.
+    Combine normalized TIFF files into a final RGB image using ImageMagick.
+
+    Supported palettes (detected automatically from available channels):
+      - Mono       : single channel (any filter)
+      - RGB        : RED + GREEN + BLUE
+      - HOO        : HA→R, blend(HA 30% + OIII 70%)→G, OIII→B
+      - SHO        : SII→R, HA→G, OIII→B  (classic Hubble palette)
+      - SHO+RGB    : SHO with color stars blended from RGB (80% NB / 20% RGB)
+      - SHA        : SII→R, HA→G, BLUE→B  (or darkened HA fallback if no BLUE)
+      - HaRGB      : blend(HA 60% + RED 40%)→R, GREEN→G, BLUE→B
+
+    Each palette applies a tailored post-processing chain (level, tone curve,
+    saturation, sharpening) to account for the very different signal
+    characteristics of narrowband vs broadband data.
     """
     output_file = session_dir / f"{file_prefix}_full.{output_format}"
 
-    # 1. Determine reference geometry for black areas (xc:black)
+    # Resolve reference geometry for synthetic black channels (xc:black)
     ref_path = next(iter(tif_files.values()))
     width, height = get_image_dimensions(ref_path)
 
     # ------------------------------------------------------------------
-    # Single channel (Mono or simple raw extraction)
+    # MONO — single channel passthrough
+    # No combination needed; apply a simple stretch and export directly.
     # ------------------------------------------------------------------
     if len(tif_files) == 1:
         single_channel = list(tif_files.values())[0]
@@ -756,7 +769,7 @@ def compose_rgb_image(
             return False
 
     # ------------------------------------------------------------------
-    # DETERMINE ASSEMBLY MODE ---
+    # CHANNEL DETECTION
     # ------------------------------------------------------------------
     has_ha   = "HA"   in tif_files
     has_oiii = "OIII" in tif_files
@@ -764,13 +777,17 @@ def compose_rgb_image(
     has_rgb  = all(k in tif_files for k in ("RED", "GREEN", "BLUE"))
 
     def chan(key: str) -> str:
-        """Returns the channel path or a black channel of the correct size."""
+        """Return the channel TIFF path, or a synthetic black image of the correct size."""
         if key in tif_files:
             return str(tif_files[key])
         return f"xc:black[{width}x{height}]"
 
     def blend_cmd(img_a: str, img_b: str, pct_a: int) -> list:
-        """Blend two images: pct_a% of img_a + (100-pct_a)% of img_b."""
+        """
+        Blend two images using ImageMagick -compose Blend.
+        Result = (pct_a% × img_a) + ((100 - pct_a)% × img_b)
+        Must be used inside a -combine pipeline: each blend produces one channel.
+        """
         return [
             "(", img_a, img_b,
             "-define", f"compose:args={pct_a},{100 - pct_a}",
@@ -780,111 +797,162 @@ def compose_rgb_image(
         ]
 
     # ------------------------------------------------------------------
-    # SHO + RGB PALETTE : blend color stars (80% NB / 20% RGB)
+    # PALETTE SELECTION — priority order matters:
+    # SHO+RGB before SHO (superset), HOO before RGB (narrowband priority)
     # ------------------------------------------------------------------
+
+    # SHO + RGB : full narrowband palette with color star blending
+    # Each channel = 80% narrowband + 20% broadband RGB
+    # Preserves natural star colors while keeping NB nebulosity dominant.
     if has_sii and has_ha and has_oiii and has_rgb:
-        debug("Palette: SHO+RGB blend (color stars)")
+        debug("Palette: SHO+RGB (color stars blend)")
         cmd = ["convert"]
         for nb_key, rgb_key in [("SII", "RED"), ("HA", "GREEN"), ("OIII", "BLUE")]:
             cmd.extend(blend_cmd(chan(nb_key), chan(rgb_key), 80))
         palette_label = "SHO+RGB"
 
-    # ------------------------------------------------------------------
-    # SHO PALETTE : SII→R, HA→G, OIII→B  (classic Hubble palette)
-    # ------------------------------------------------------------------
+    # SHO : classic Hubble palette — SII→R, HA→G, OIII→B
     elif has_sii and has_ha and has_oiii:
         debug("Palette: SHO (Hubble)")
         cmd = ["convert", chan("SII"), chan("HA"), chan("OIII")]
         palette_label = "SHO"
 
-    # ------------------------------------------------------------------
-    # HOO PALETTE : HA→R, OIII→G, OIII→B  (more natural colors)
-    # ------------------------------------------------------------------
+    # HOO : HA→R, blend(HA+OIII)→G, OIII→B
+    # The blended green channel (30% HA / 70% OIII) creates smooth color
+    # transitions between HA-dominant (red/orange) and OIII-dominant (blue/cyan)
+    # regions, avoiding the flat blue-gray look of a pure OIII green.
     elif has_ha and has_oiii and not has_sii:
         debug("Palette: HOO")
         cmd = ["convert",
-            chan("HA"),
-            *blend_cmd(chan("HA"), chan("OIII"), 30),  # G = 30% HA + 70% OIII
-            chan("OIII"),
+            chan("HA"),                                      # R = HA
+            *blend_cmd(chan("HA"), chan("OIII"), 30),        # G = 30% HA + 70% OIII
+            chan("OIII"),                                    # B = OIII
         ]
         palette_label = "HOO"
 
-    # ------------------------------------------------------------------
-    # SHα PALETTE (SII + HA without OIII) : SII→R, HA→G, black→B
-    # ------------------------------------------------------------------
+    # SHA : SII→R, HA→G, BLUE→B (or darkened HA fallback)
+    # Used when OIII is unavailable. If a broadband BLUE channel exists it
+    # provides a real blue reference; otherwise HA is gamma-darkened to
+    # simulate a cooler blue-shifted channel without a pure black gap.
     elif has_sii and has_ha and not has_oiii:
-        debug("Palette: SHA (without OIII)")
+        debug("Palette: SHA")
         if has_rgb:
-            # Best: SII→R, HA→G, BLUE channel
-            debug("  Using SHA with RGB blue channel")
+            # Ideal: use the real broadband BLUE channel for the blue slot
+            debug("  SHA: using broadband BLUE channel")
             cmd = ["convert", chan("SII"), chan("HA"), chan("BLUE")]
         else:
-            # Fallback: SII→R, HA→G, HA (darkened for B)
-            debug("  SHA fallback: HA duplicated with reduced intensity")
+            # Fallback: darken HA via gamma boost to simulate a blue-shifted channel
+            # -level 0%,100%,1.5 raises midtones; -modulate 60 reduces overall brightness
+            debug("  SHA fallback: gamma-darkened HA as synthetic blue channel")
             cmd = [
                 "convert",
                 chan("SII"),
                 chan("HA"),
-                f"{chan('HA')} -modulate 100,50,80"
+                "(", chan("HA"),
+                    "-level", "0%,100%,1.5",
+                    "-modulate", "60",
+                ")",
             ]
         palette_label = "SHA"
 
-    # ------------------------------------------------------------------
-    # HaRGB PALETTE (todo)
-    # ------------------------------------------------------------------
+    # HaRGB : HA-enriched red channel blended with broadband RGB
+    # Boosts ionized hydrogen regions (HA) in the red channel while keeping
+    # natural star colors from the broadband GREEN and BLUE channels.
     elif has_ha and has_rgb:
         debug("Palette: HaRGB")
         cmd = ["convert",
-            *blend_cmd(chan("HA"), chan("RED"), 60),  # R = 60% HA + 40% RED
-            chan("GREEN"),
-            chan("BLUE"),
+            *blend_cmd(chan("HA"), chan("RED"), 60),         # R = 60% HA + 40% RED
+            chan("GREEN"),                                   # G = broadband GREEN
+            chan("BLUE"),                                    # B = broadband BLUE
         ]
         palette_label = "HaRGB"
 
-    # ------------------------------------------------------------------
-    # CLASSIC RGB (or any other combination)
-    # ------------------------------------------------------------------
+    # Classic RGB — standard broadband color image
     else:
-        debug("Palette: classic RGB")
+        debug("Palette: RGB")
         missing_channels = [k for k in ("RED", "GREEN", "BLUE") if k not in tif_files]
         if missing_channels:
-            debug(f"WARNING: Missing RGB channels {missing_channels}, filling with black.")
+            debug(f"WARNING: missing RGB channels {missing_channels}, filling with black.")
         cmd = ["convert", chan("RED"), chan("GREEN"), chan("BLUE")]
         palette_label = "RGB"
 
     # ------------------------------------------------------------------
-    # FINALIZATION : combine + post-processing + export
-    # The -level and -combine apply correctly AFTER the channels
+    # FINALIZATION — combine channels then apply palette-specific
+    # post-processing: level clip, tone curve, saturation, sharpening.
+    #
+    # Design rationale per palette:
+    #
+    #   SHO / SHO+RGB
+    #     Hubble palette has very narrow tonal range per channel.
+    #     Gentle level clip (0.5%) preserves faint emission structures.
+    #     Moderate sigmoidal (3x45%) avoids crushing the dim filaments.
+    #     Saturation boost (135%) compensates for the inherently muted
+    #     SII/HA/OIII color separation after combination.
+    #
+    #   HOO
+    #     Similar narrowband constraints. Slightly lower saturation (125%)
+    #     than SHO because the blended green channel already adds variety.
+    #
+    #   SHA
+    #     Bi-filter palette; less chromatic range than tri-filter.
+    #     Lower saturation boost (115%) to avoid over-saturating the
+    #     SII red channel which tends to dominate.
+    #
+    #   HaRGB
+    #     Mixed narrowband/broadband. Moderate sigmoidal + light saturation
+    #     boost (110%) to enhance HA regions without skewing star colors.
+    #
+    #   RGB
+    #     Standard broadband. Stronger sigmoidal (4x50%) for punchier
+    #     contrast. Larger unsharp radius for star/detail crispness.
     # ------------------------------------------------------------------
     cmd.extend([
         "-combine",
         "-colorspace", "sRGB",
-        # "-morphology", "Erode", "Disk:0.5",
     ])
 
-    if palette_label in ("SHO", "HOO", "SHO+RGB", "SHA"):
-        # For narrowband palettes, use gentle level + tone curve
+    if palette_label in ("SHO", "SHO+RGB"):
         cmd.extend([
             "-level", "0.5%,99.5%",
-            "-sigmoidal-contrast", "2x50%",
-            "-modulate", "100,130",
-            "-unsharp", "0.5x1.0+0.02+0.01",
+            "-sigmoidal-contrast", "2x50%", # "3x45%",
+            "-modulate", "100,135",
+            "-unsharp", "0.5x1.0+0.5+0.01",
         ])
+
+    elif palette_label == "HOO":
+        cmd.extend([
+            "-level", "0.5%,99.5%",
+            "-sigmoidal-contrast", "3x45%",
+            "-modulate", "100,125",
+            "-unsharp", "0.5x1.0+0.5+0.01",
+        ])
+
+    elif palette_label == "SHA":
+        cmd.extend([
+            "-level", "0.5%,99.5%",
+            "-sigmoidal-contrast", "3x45%",
+            "-modulate", "100,115",
+            "-unsharp", "0.5x1.0+0.5+0.01",
+        ])
+
+    elif palette_label == "HaRGB":
+        cmd.extend([
+            "-level", "1%,99%",
+            "-sigmoidal-contrast", "3x45%",
+            "-modulate", "100,110",
+            "-unsharp", "0x1.0+0.6+0.02",
+        ])
+
     elif palette_label == "RGB":
         cmd.extend([
             "-level", "1%,98%",
             "-sigmoidal-contrast", "4x50%",
             "-unsharp", "0x1.2+0.8+0.05",
         ])
+
     else:
+        # Safety fallback — should never be reached with the palette logic above
         cmd.extend(["-level", "2%,98%"])
-
-    if palette_label in ("SHO", "HOO", "SHO+RGB"):
-        cmd.extend(["-modulate", "100,135"])
-        cmd.extend(["-unsharp", "0.5x1.0+0.02+0.01"])
-
-    if palette_label == "RGB":
-        cmd.extend(["-unsharp", "0x1.2+0.8+0.05"])
 
     if output_format in ["webp", "jpg"]:
         cmd.extend(["-quality", "95"])
@@ -894,7 +962,12 @@ def compose_rgb_image(
     debug(f"ImageMagick [{palette_label}]: {' '.join(str(c) for c in cmd)}")
 
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
         if result.returncode != 0:
             debug(f"ImageMagick STDERR: {result.stderr}")
         return result.returncode == 0
