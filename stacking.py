@@ -42,7 +42,9 @@ VALID_FILTERS = [
 NARROWBAND_FILTERS = {'HA', 'OIII', 'SII', 'HALPHA', 'H_BETA'}
 BROADBAND_FILTERS = {'RED', 'GREEN', 'BLUE', 'CLEAR', 'LUMINANCE', 'L', 'R', 'G', 'B'}
 VERBOSE = False
+DSO_NAME = ''
 VALID_EXTENSIONS = {'.fits', '.fit', '.fts', '.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}
+DENOISE_FRAME_THRESHOLD = 10
 
 def debug(message: str):
     if VERBOSE:
@@ -365,28 +367,64 @@ def get_subsky_command(
 
 def get_color_calibration_command(
     is_color: bool,
-    dso_name: str,
+    filter_name: str,
     light_files: list,
 ) -> str:
+    """
+    Returns a Siril 1.2 color calibration command for OSC broadband data only.
+
+    Siril 1.2 only supports pcc (Photometric Color Calibration) as a scriptable
+    color calibration command. cc -nostellar does not exist until Siril 1.4.
+
+    pcc requires either:
+      - A pre-plate-solved image (WCS in FITS header), OR
+      - Explicit coordinates + focal length + pixel size for on-the-fly plate solving
+
+    Both cases require network access to download the star catalog (NOMAD by default).
+    If the network is unavailable, pcc fails silently and no calibration is applied.
+
+    Never apply color calibration on:
+      - Mono camera data (no color channels)
+      - Narrowband filters (monochromatic signal — cc would corrupt filter ratios)
+    """
     if not is_color:
         return ""
 
-    # Tentative PCC si DSO connu et métadonnées disponibles
-    if dso_name and dso_name not in ("unknown", ""):
+    if filter_name.upper() in NARROWBAND_FILTERS:
+        return ""
+
+    # Attempt to read optical metadata from the first light FITS header.
+    # focal length and pixel size allow pcc to plate-solve on-the-fly
+    # if no WCS solution is already present in the stacked image.
+    if light_files:
         try:
-            with fits.open(light_files[0], mode='readonly', ignore_missing_end=True) as hdul:
-                h = hdul[0].header
-                focal = h.get('FOCALLEN')
+            with fits.open(
+                light_files[0],
+                mode='readonly',
+                ignore_missing_end=True
+            ) as hdul:
+                h          = hdul[0].header
+                focal      = h.get('FOCALLEN')
                 pixel_size = h.get('XPIXSZ') or h.get('PIXSIZE')
+
                 if focal and pixel_size:
-                    return f"pcc -cc={dso_name.upper()} -focal={int(focal)} -pixel={float(pixel_size)}"
+                    debug(f"PCC: focal={int(focal)}mm pixel={float(pixel_size)}µm")
+                    # -noflip: stacked images are not expected to need flipping
+                    # -downscale: faster star detection on large OSC images
+#                     return (
+#                         f"pcc -focal={int(focal)}"
+#                         f" -pixelsize={float(pixel_size)}"
+#                         f" -noflip"
+#                         f" -downscale"
+#                     )
+                    return ""
         except Exception as e:
-            debug(f"PCC impossible ({e}), fallback cc")
+            debug(f"PCC metadata read failed ({e}), skipping color calibration")
 
-    # Fallback : calibration locale standard Siril 1.2
-    return "cc -nostellar"
-
-DENOISE_FRAME_THRESHOLD = 10
+    # Fallback: attempt pcc without optical metadata (relies on existing WCS)
+    debug("PCC: no focal/pixelsize metadata found, attempting pcc with existing WCS")
+#     return "pcc -noflip -downscale"
+    return ""
 
 def should_apply_denoise(
     filter_name: str,
@@ -571,7 +609,8 @@ def generate_siril_stack_script(
     master_dark_path: str = None,
     master_flat_path: str = None,
     master_bias_path: str = None,
-    output_bits: int = 32
+    output_bits: int = 32,
+    light_files: list = None,
 ) -> str:
     """
     Generates the .ssf script for Siril.
@@ -702,7 +741,7 @@ def generate_siril_stack_script(
 
     lines.extend([
         get_subsky_command(master_dark_path, master_flat_path, master_bias_path),
-#         get_color_calibration_command(is_color, '', ),
+        get_color_calibration_command(is_color, filter_name, light_files or []),
         get_rmgreen_command(is_color),
         f"denoise -da3d -mod={denoise_mod}" if apply_denoise else "",
         *stretch_cmds,
@@ -1235,7 +1274,7 @@ def run(args) -> bool:
 
     lights_dir = current_session_dir / "lights"
     format_requested = args.format.lower()
-    dso_name = re.sub(r'[^a-zA-Z0-9_-]', '', args.dso.lower().replace(" ", ""))
+    dso_name = re.sub(r'[^a-zA-Z0-9_-]', '', DSO_NAME.lower().replace(" ", ""))
 
     first_light = None
     for f in sorted(lights_dir.iterdir()):
@@ -1386,7 +1425,8 @@ def run(args) -> bool:
             master_dark_path,
             master_flat_path,
             master_bias_path,
-            output_bits=output_bits
+            output_bits=output_bits,
+            light_files=sorted(files_by_filter[current_filter]),
         )
         success = run_siril_command(
             current_session_dir,
@@ -1505,7 +1545,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     VERBOSE = args.verbose
-
+    DSO_NAME = args.dso
     try:
         success = run(args)
         if not success:
