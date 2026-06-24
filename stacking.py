@@ -853,7 +853,18 @@ def compose_rgb_image(
     # ------------------------------------------------------------------
     if len(tif_files) == 1:
         single_channel = list(tif_files.values())[0]
+        filter_key = list(tif_files.keys())[0]
         cmd = ["convert", str(single_channel)]
+
+        # CLEAR/L broadband mono: apply a proper stretch pipeline.
+        # Without this, the passthrough produces a flat, underprocessed image.
+        if filter_key.upper() in ("CLEAR", "L", "LUMINANCE"):
+            cmd.extend([
+                "-level", "1%,99%",
+                "-sigmoidal-contrast", "4x50%",
+                "-unsharp", "0x1.0+0.5+0.02",
+            ])
+
         if output_format in ["webp", "jpg"]:
             cmd.extend(["-quality", "95"])
         cmd.append(str(output_file))
@@ -1044,7 +1055,8 @@ def compose_rgb_image(
         cmd.extend([
             "-level", "1%,98%",
             "-sigmoidal-contrast", "4x50%",
-            "-unsharp", "0x1.0+0.5+0.02",
+#             "-unsharp", "0x1.0+0.5+0.02",
+            "-unsharp", "0x1.2+0.8+0.05",
         ])
 
     else:
