@@ -829,17 +829,22 @@ def compose_rgb_image(
     Combine normalized TIFF files into a final RGB image using ImageMagick.
 
     Supported palettes (detected automatically from available channels):
-      - Mono       : single channel (any filter)
-      - RGB        : RED + GREEN + BLUE
-      - HOO        : HA→R, blend(HA 30% + OIII 70%)→G, OIII→B
-      - SHO        : SII→R, HA→G, OIII→B  (classic Hubble palette)
-      - SHO+RGB    : SHO with color stars blended from RGB (80% NB / 20% RGB)
-      - SHA        : SII→R, HA→G, BLUE→B  (or darkened HA fallback if no BLUE)
-      - HaRGB      : blend(HA 60% + RED 40%)→R, GREEN→G, BLUE→B
+      - CLEAR / L  : single broadband mono channel with full post-processing
+      - Mono        : single channel (any other filter) — passthrough
+      - RGB         : RED + GREEN + BLUE
+      - HOO         : HA→R, blend(HA 30% + OIII 70%)→G, OIII→B
+      - SHO         : SII→R, HA→G, OIII→B  (classic Hubble palette)
+      - SHO+RGB     : SHO with color stars blended from RGB (80% NB / 20% RGB)
+      - SHA         : SII→R, HA→G, BLUE→B  (or darkened HA fallback if no BLUE)
+      - HaRGB       : blend(HA 60% + RED 40%)→R, GREEN→G, BLUE→B
 
     Each palette applies a tailored post-processing chain (level, tone curve,
     saturation, sharpening) to account for the very different signal
     characteristics of narrowband vs broadband data.
+
+    CLEAR/L/LUMINANCE are treated as a named palette rather than a generic
+    mono passthrough so that broadband OSC images receive proper post-processing
+    (sigmoidal contrast, sharpening) instead of being exported flat.
     """
     output_file = session_dir / f"{file_prefix}_full.{output_format}"
 
@@ -848,40 +853,16 @@ def compose_rgb_image(
     width, height = get_image_dimensions(ref_path)
 
     # ------------------------------------------------------------------
-    # MONO — single channel passthrough
-    # No combination needed; apply a simple stretch and export directly.
-    # ------------------------------------------------------------------
-    if len(tif_files) == 1:
-        single_channel = list(tif_files.values())[0]
-        filter_key = list(tif_files.keys())[0]
-        cmd = ["convert", str(single_channel)]
-
-        # CLEAR/L broadband mono: apply a proper stretch pipeline.
-        # Without this, the passthrough produces a flat, underprocessed image.
-        if filter_key.upper() in ("CLEAR", "L", "LUMINANCE"):
-            cmd.extend([
-                "-level", "1%,99%",
-                "-sigmoidal-contrast", "4x50%",
-                "-unsharp", "0x1.0+0.5+0.02",
-            ])
-
-        if output_format in ["webp", "jpg"]:
-            cmd.extend(["-quality", "95"])
-        cmd.append(str(output_file))
-        try:
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            return result.returncode == 0
-        except Exception as e:
-            debug(f"ImageMagick Single Channel Failure: {e}")
-            return False
-
-    # ------------------------------------------------------------------
     # CHANNEL DETECTION
     # ------------------------------------------------------------------
-    has_ha   = "HA"   in tif_files
-    has_oiii = "OIII" in tif_files
-    has_sii  = "SII"  in tif_files
-    has_rgb  = all(k in tif_files for k in ("RED", "GREEN", "BLUE"))
+    has_ha        = "HA"    in tif_files
+    has_oiii      = "OIII"  in tif_files
+    has_sii       = "SII"   in tif_files
+    has_rgb       = all(k in tif_files for k in ("RED", "GREEN", "BLUE"))
+    has_clear     = any(k in tif_files for k in ("CLEAR", "L", "LUMINANCE"))
+
+    # Resolve the actual key used for the broadband mono channel
+    clear_key     = next((k for k in ("CLEAR", "L", "LUMINANCE") if k in tif_files), None)
 
     def chan(key: str) -> str:
         """Return the channel TIFF path, or a synthetic black image of the correct size."""
@@ -904,12 +885,36 @@ def compose_rgb_image(
         ]
 
     # ------------------------------------------------------------------
+    # MONO PASSTHROUGH — single channel, not broadband
+    # No combination needed; export directly without post-processing.
+    # CLEAR/L/LUMINANCE are handled below as a named palette instead.
+    # ------------------------------------------------------------------
+    if len(tif_files) == 1 and not has_clear:
+        single_channel = list(tif_files.values())[0]
+        cmd = ["convert", str(single_channel)]
+        if output_format in ["webp", "jpg"]:
+            cmd.extend(["-quality", "95"])
+        cmd.append(str(output_file))
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            return result.returncode == 0
+        except Exception as e:
+            debug(f"ImageMagick Single Channel Failure: {e}")
+            return False
+
+    # ------------------------------------------------------------------
     # PALETTE SELECTION — priority order matters:
-    # SHO+RGB before SHO (superset), HOO before RGB (narrowband priority)
+    # SHO+RGB before SHO (superset), HOO before RGB (narrowband priority),
+    # CLEAR before RGB fallback (explicit broadband mono handling).
     # ------------------------------------------------------------------
 
-    # SHO + RGB : full narrowband palette with color star blending
-    # Each channel = 80% narrowband + 20% broadband RGB
+    # SHO + RGB : full narrowband palette with color star blending.
+    # Each channel = 80% narrowband + 20% broadband RGB.
     # Preserves natural star colors while keeping NB nebulosity dominant.
     if has_sii and has_ha and has_oiii and has_rgb:
         debug("Palette: SHO+RGB (color stars blend)")
@@ -948,8 +953,8 @@ def compose_rgb_image(
             debug("  SHA: using broadband BLUE channel")
             cmd = ["convert", chan("SII"), chan("HA"), chan("BLUE")]
         else:
-            # Fallback: darken HA via gamma boost to simulate a blue-shifted channel
-            # -level 0%,100%,1.5 raises midtones; -modulate 60 reduces overall brightness
+            # Fallback: darken HA via gamma boost to simulate a blue-shifted channel.
+            # -level 0%,100%,1.5 raises midtones; -modulate 60 reduces overall brightness.
             debug("  SHA fallback: gamma-darkened HA as synthetic blue channel")
             cmd = [
                 "convert",
@@ -962,7 +967,7 @@ def compose_rgb_image(
             ]
         palette_label = "SHA"
 
-    # HaRGB : HA-enriched red channel blended with broadband RGB
+    # HaRGB : HA-enriched red channel blended with broadband RGB.
     # Boosts ionized hydrogen regions (HA) in the red channel while keeping
     # natural star colors from the broadband GREEN and BLUE channels.
     elif has_ha and has_rgb:
@@ -974,7 +979,17 @@ def compose_rgb_image(
         ]
         palette_label = "HaRGB"
 
-    # Classic RGB — standard broadband color image
+    # CLEAR / L / LUMINANCE : broadband mono channel.
+    # Treated as a named palette to apply a proper post-processing chain.
+    # A generic passthrough would export a flat, low-contrast image on
+    # diffuse nebulae (M16, M42) where the dynamic range is compressed
+    # after Siril's autostretch.
+    elif has_clear:
+        debug(f"Palette: CLEAR (key={clear_key})")
+        cmd = ["convert", str(tif_files[clear_key])]
+        palette_label = "CLEAR"
+
+    # Classic RGB — standard broadband color image.
     else:
         debug("Palette: RGB")
         missing_channels = [k for k in ("RED", "GREEN", "BLUE") if k not in tif_files]
@@ -984,6 +999,7 @@ def compose_rgb_image(
         palette_label = "RGB"
 
     emit("progress", data={"step": "combine", "message": f"Selected palette: {palette_label}"})
+
     # ------------------------------------------------------------------
     # FINALIZATION — combine channels then apply palette-specific
     # post-processing: level clip, tone curve, saturation, sharpening.
@@ -996,10 +1012,13 @@ def compose_rgb_image(
     #     Moderate sigmoidal (3x45%) avoids crushing the dim filaments.
     #     Saturation boost (135%) compensates for the inherently muted
     #     SII/HA/OIII color separation after combination.
+    #     Green cast correction (-level 0%,95% on Green channel) removes
+    #     the yellow-green tint inherent to the HA→G mapping.
     #
     #   HOO
-    #     Similar narrowband constraints. Slightly lower saturation (125%)
-    #     than SHO because the blended green channel already adds variety.
+    #     Similar narrowband constraints. Slightly lower saturation (145%)
+    #     and stronger sigmoidal (4x45%) because the blended green channel
+    #     adds chromatic variety but OIII-dominant targets need more punch.
     #
     #   SHA
     #     Bi-filter palette; less chromatic range than tri-filter.
@@ -1013,11 +1032,20 @@ def compose_rgb_image(
     #   RGB
     #     Standard broadband. Stronger sigmoidal (4x50%) for punchier
     #     contrast. Larger unsharp radius for star/detail crispness.
+    #
+    #   CLEAR / L / LUMINANCE
+    #     Broadband mono. No -combine step (single channel).
+    #     Sigmoidal (4x50%) matches RGB broadband treatment.
+    #     Lighter sharpening than RGB to avoid amplifying mono noise.
     # ------------------------------------------------------------------
-    cmd.extend([
-        "-combine",
-        "-colorspace", "sRGB",
-    ])
+
+    # Multi-channel palettes need -combine to merge R/G/B into a single image.
+    # CLEAR and Mono passthrough are already single images — skip -combine.
+    if palette_label not in ("CLEAR",):
+        cmd.extend([
+            "-combine",
+            "-colorspace", "sRGB",
+        ])
 
     if palette_label in ("SHO", "SHO+RGB"):
         cmd.extend([
@@ -1025,8 +1053,12 @@ def compose_rgb_image(
             "-sigmoidal-contrast", "3x45%",
             "-modulate", "100,135",
             "-unsharp", "0.5x1.0+0.5+0.01",
+            # Subtle green cast reduction: HA mapped to Green introduces a
+            # yellow-green tint on stars; pulling the Green ceiling to 95%
+            # neutralizes it without affecting nebula hue significantly.
+            "-channel", "Green", "-level", "0%,95%", "+channel",
         ])
-        cmd.extend(["-channel", "Green", "-level", "0%,95%", "+channel"])
+
     elif palette_label == "HOO":
         cmd.extend([
             "-level", "0.5%,99.5%",
@@ -1057,6 +1089,13 @@ def compose_rgb_image(
             "-sigmoidal-contrast", "4x50%",
 #             "-unsharp", "0x1.0+0.5+0.02",
             "-unsharp", "0x1.2+0.8+0.05",
+        ])
+
+    elif palette_label == "CLEAR":
+        cmd.extend([
+            "-level", "1%,99%",
+            "-sigmoidal-contrast", "4x50%",
+            "-unsharp", "0x1.0+0.5+0.02",
         ])
 
     else:
