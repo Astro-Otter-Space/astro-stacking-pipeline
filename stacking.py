@@ -35,7 +35,8 @@ BASE_DIR = Path(__file__).resolve().parent
 # Valid filters accepted and recognized by the system
 VALID_FILTERS = [
     'IR_CUT', 'UV_IR_CUT', 'UHC', 'CLS', 'BROADBAND', 'DUAL_NARROWBAND',
-    'LRGB', 'LUMINANCE', 'RED', 'GREEN', 'BLUE', 'RGB', 'HA', 'H_BETA',
+    'LRGB', 'LUMINANCE', 'L',
+    'RED', 'GREEN', 'BLUE', 'RGB', 'HA', 'H_BETA',
     'OIII', 'SII', 'SOLAR', 'CLEAR'
 ]
 
@@ -357,13 +358,11 @@ def get_subsky_command(
         degree = 3
         if nb_missing == 1:
             tolerance, samples = 1.4, 60
+            return f'{base_cmd} {degree} -tolerance={tolerance} -samples={samples}'
         elif nb_missing == 2:
-          tolerance, samples, degree = 1.6, 65, 2
+            return 'subsky -rbf -tolerance=1.5 -smooth=0.7 -samples=60'
         else:
-            tolerance, samples, degree = 1.3, 80, 2
-
-        emit("progress", data={"degree": degree, "tolerance": tolerance, "samples": samples})
-        return f'{base_cmd} {degree} -tolerance={tolerance} -samples={samples}'
+            return 'subsky -rbf -tolerance=1.3 -smooth=0.9 -samples=70'
 
 def get_color_calibration_command(
     is_color: bool,
@@ -538,6 +537,7 @@ def get_stretch_command(
     is_narrowband  = filter_name.upper() in NARROWBAND_FILTERS
     is_rgb_channel = filter_name.upper() in {"RED", "GREEN", "BLUE"}
     is_broadband   = filter_name.upper() in BROADBAND_FILTERS
+    is_luminance   = filter_name.upper() in ("L", "LUMINANCE")
 
     # Signal quality score — drives targetbg selection
     good_stack  = num_files >= 20 and has_masters
@@ -579,6 +579,14 @@ def get_stretch_command(
     # ------------------------------------------------------------------
     # MONO CAMERA — broadband (CLEAR, L, LUMINANCE)
     # ------------------------------------------------------------------
+    if is_luminance:
+        if good_stack:
+            return ["autostretch -linked -3.0 0.20"]
+        elif medium_stack:
+            return ["autostretch -linked -2.8 0.22"]
+        else:
+            return ["autostretch -linked -2.8 0.25"]
+
     if is_broadband:
         return ["autostretch -linked -2.8 0.25"]
 
@@ -979,6 +987,30 @@ def compose_rgb_image(
         ]
         palette_label = "HaRGB"
 
+    elif has_clear and has_rgb:
+        debug(f"Palette: LRGB (key={clear_key})")
+        cmd = ["convert",
+            # Build the RGB color base
+            "(", chan("RED"), chan("GREEN"), chan("BLUE"),
+                "-combine", "-colorspace", "sRGB",
+                "-colorspace", "LAB",
+            ")",
+            # Force L channel to 3-channel to avoid grayscale compositing issues
+            "(", str(tif_files[clear_key]),
+                "-colorspace", "gray",
+                "-colorspace", "RGB",   # expand to 3 channels
+                "-colorspace", "LAB",
+            ")",
+            # Replace L* (= R channel in LAB) with dedicated luminance channel
+            "-channel", "R",
+            "-compose", "Copy",           # in HSL, Lightness = Red slot
+            "-composite",
+            "+channel",
+            # Convert back to sRGB for final output
+            "-colorspace", "sRGB",
+        ]
+        palette_label = "LRGB"
+
     # CLEAR / L / LUMINANCE : broadband mono channel.
     # Treated as a named palette to apply a proper post-processing chain.
     # A generic passthrough would export a flat, low-contrast image on
@@ -1041,7 +1073,7 @@ def compose_rgb_image(
 
     # Multi-channel palettes need -combine to merge R/G/B into a single image.
     # CLEAR and Mono passthrough are already single images — skip -combine.
-    if palette_label not in ("CLEAR",):
+    if palette_label not in ("CLEAR", "LRGB"):
         cmd.extend([
             "-combine",
             "-colorspace", "sRGB",
@@ -1083,6 +1115,14 @@ def compose_rgb_image(
             "-unsharp", "0x1.0+0.6+0.02",
         ])
 
+    elif palette_label == "LRGB":
+        cmd.extend([
+            "-level", "1%,99%",
+            "-sigmoidal-contrast", "3x50%",
+            "-modulate", "100,110",           # slight chrominance saturation boost
+            "-unsharp", "0x1.0+0.6+0.02",
+        ])
+
     elif palette_label == "RGB":
         cmd.extend([
             "-level", "1%,98%",
@@ -1094,7 +1134,7 @@ def compose_rgb_image(
     elif palette_label == "CLEAR":
         cmd.extend([
             "-level", "1%,99%",
-            "-sigmoidal-contrast", "4x50%",
+            "-sigmoidal-contrast", "3x48%",
             "-unsharp", "0x1.0+0.5+0.02",
         ])
 
@@ -1286,11 +1326,12 @@ def cleanup_session(session_dir: Path):
         "work_*/",           # Working directories
 #        "stacked_*.fit",     # Stacked masters
         "stacked_*.tif",     # Masters converted to TIFF
+        "*_aligned.fit",
         "r_pp_*.fit",        # Calibrated sequences
         "pp_*.fit",          # Pre-calibration
         "r_light_*.fit",     # Aligned lights
         "light_*.fit",       # Converted lights
-        "master_*_2d.fit",   # ✅ Residual gradient models generated by subsky
+        "master*_2d.fit",    # ✅ Residual gradient models generated by subsky
         "*.ssf"              # Temporary Siril scripts
     ]
 
@@ -1395,10 +1436,13 @@ def run(args) -> bool:
             # Step 2: If step 1 failed or no valid filter found, try with filename
             if matched_filter is None:
                 filename_upper = f.name.upper()
-                for v_filter in VALID_FILTERS:
-                    if v_filter in filename_upper:
-                        matched_filter = v_filter
-                        break
+                if re.search(r'[_\s]L[_\s\.]', filename_upper):
+                    matched_filter = "LUMINANCE"
+                else:
+                    for v_filter in VALID_FILTERS:
+                        if v_filter in filename_upper:
+                            matched_filter = v_filter
+                            break
 
             # Step 3: If both previous steps failed, default to CLEAR
             if matched_filter is None:
@@ -1425,8 +1469,7 @@ def run(args) -> bool:
     # 2. Sensor type diagnostic on the first available raw
     first_filter_key = detected_filters[0]
     first_fits_file = files_by_filter[first_filter_key][0]
-    camera_is_color = is_color_camera(first_fits_file)
-    emit("progress", data={"step": "sensor_type", "type": "color" if camera_is_color else "mono"})
+#     camera_is_color = is_color_camera(first_fits_file)
 
     # Dictionary for storing generated master FITS for final cross-alignment
     master_files_map = {}
@@ -1447,6 +1490,9 @@ def run(args) -> bool:
                 "bias": bool(master_bias_path)
              }
         })
+
+        first_filter_is_color = is_color_camera(first_fits_file)
+        emit("progress", data={"step": "sensor_type", "type": "color" if first_filter_is_color else "mono"})
 
         filter_work_dir = current_session_dir / f"work_{current_filter}"
         filter_work_dir.mkdir(parents=True, exist_ok=True)
@@ -1471,7 +1517,7 @@ def run(args) -> bool:
             filter_work_dir,
             current_filter,
             num_files,
-            camera_is_color,
+            first_filter_is_color,
             detected_filters,
             master_dark_path,
             master_flat_path,
