@@ -706,17 +706,20 @@ def generate_siril_stack_script(
     # REJECTION METHOD
     # sigma      < 6 frames  : Winsorized unstable with few data points
     # winsorized 6–49 frames : good balance robustness/performance
-    # linear     >= 50 frames: Linear Fit Clipping, better on large stacks
+    # linear     >= 100 frames: Linear Fit Clipping, better on large stacks
     # -------------------------------------------------------------------------
-    if num_files < 6:
-        rejection = "sigma"
-        sigmas = "3 3"
-    elif num_files >= 100:
-        rejection = "linear"
-        sigmas = "3 3"
+    if num_files <= 3:
+        rejection     = None      # no rejection at all
+        sigmas        = None
+    elif num_files <= 5:
+        rejection     = "sigma"
+        sigmas        = "4 4"     # wide bounds — avoid over-clipping small stacks
+    elif num_files <= 100:
+        rejection     = "winsorized"
+        sigmas        = "3 3"
     else:
-        rejection = "winsorized"
-        sigmas = "3 3"
+        rejection     = "linear"
+        sigmas        = "4 3"
 
     # -------------------------------------------------------------------------
     # WEIGHTING
@@ -772,10 +775,13 @@ def generate_siril_stack_script(
         filters.append("-filter-wfwhm=90%")
 
     filter_str = " ".join(filters)
+    if rejection is None:
+        stack_cmd = f"stack r_{seq} -norm=addscale"
+    else:
+        stack_cmd = f"stack r_{seq} rej {rejection} {sigmas} -norm=addscale"
 
     stack_parts = [
-        f"stack r_{seq} rej {rejection} {sigmas}",
-        "-norm=addscale",
+        stack_cmd,
         weight,
         filter_str
     ]
