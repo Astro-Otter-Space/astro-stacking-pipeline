@@ -45,7 +45,7 @@ BROADBAND_FILTERS = {'RED', 'GREEN', 'BLUE', 'CLEAR', 'LUMINANCE', 'L', 'R', 'G'
 VERBOSE = False
 DSO_NAME = ''
 VALID_EXTENSIONS = {'.fits', '.fit', '.fts', '.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}
-DENOISE_FRAME_THRESHOLD = 10
+DENOISE_FRAME_THRESHOLD = 30
 
 def debug(message: str):
     if VERBOSE:
@@ -472,17 +472,22 @@ def should_apply_denoise(
     master_bias_path: str = None,
 ) -> tuple[bool, float]:
     """
-    Automatically determines if denoise should be applied and with what mod.
+    Automatically determines if DA3D denoise should be applied and with what mod.
     Returns (apply: bool, mod: float).
 
-    Exclusion rules (priority):
-    - Color OSC camera → disabled (inter-channel imbalance guaranteed)
-    - Multi-filter palette (SHO/HOO) → disabled (different mod per filter = color cast)
+    Exclusion rules (priority order):
+    1. Color OSC camera → never (inter-channel imbalance guaranteed)
+    2. ANY narrowband filter → never (faint filaments and extensions are
+       indistinguishable from noise at low SNR; DA3D will smooth them out
+       before stretch, causing irreversible signal loss)
+    3. Multi-filter palette → never (different mod per filter = color cast
+       on the final composite)
 
-    Activation rules:
-    - Narrowband mono + short stack → enabled
-    - Narrowband mono + missing DOF → enabled
-    - Very short stack (< 5) regardless of mono config → enabled
+    Activation rules (all must be true):
+    - Mono camera
+    - Broadband only
+    - At least DENOISE_FRAME_THRESHOLD frames (default: 20)
+    - At least one calibration master available
 
     The mod adapts to the available calibration quality.
     """
@@ -494,40 +499,50 @@ def should_apply_denoise(
         debug(f"Denoise [{filter_name}]: OFF — color OSC camera")
         return False, 0.0
 
-    # Multi-filter narrowband palette: never — observed cause of green cast
+    # Narrowband: never — faint signal is indistinguishable from noise
+    # pre-stretch; DA3D will destroy filaments, IFN halos, outer shell extensions.
+    # This applies to single-filter narrowband too (not just multi-filter).
+    is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
+    if is_narrowband:
+        debug(f"Denoise [{filter_name}]: OFF — narrowband (faint structure risk)")
+        return False, 0.0
+
+    # Multi-filter narrowband palette: green cast risk
     active_narrowband = [f for f in all_detected_filters if f in NARROWBAND_FILTERS]
     if len(active_narrowband) > 1:
         debug(f"Denoise [{filter_name}]: OFF — multi-filter palette {active_narrowband}")
         return False, 0.0
 
-    # --- MOD CALCULATION based on calibration quality ---
+    # --- ACTIVATION CONDITIONS ---
     has_dark = bool(master_dark_path)
     has_flat = bool(master_flat_path)
     has_bias = bool(master_bias_path)
     dof_count = sum([has_dark, has_flat, has_bias])
 
-    # More DOF available, less residual noise → lower mod
+    # Require minimum frames and at least one calibration master
+    if num_files < DENOISE_FRAME_THRESHOLD or dof_count == 0:
+        debug(
+            f"Denoise [{filter_name}]: OFF — "
+            f"insufficient frames ({num_files}<{DENOISE_FRAME_THRESHOLD}) "
+            f"or no calibration masters"
+        )
+        return False, 0.0
+
+    # --- MOD CALCULATION based on calibration quality ---
+    # More DOF available = less residual noise = lighter touch needed
     if dof_count == 3:
         mod = 0.4   # Complete calibration — light touch
     elif dof_count == 2:
         mod = 0.55
-    elif dof_count == 1:
-        mod = 0.7   # Reference value
     else:
-        mod = 0.85  # No DOF — more aggressive
-
-    # --- ACTIVATION CONDITIONS ---
-    is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
-    is_short_stack = num_files < DENOISE_FRAME_THRESHOLD
-    is_very_short = num_files < 5
-
-    apply = is_very_short or (is_narrowband and is_short_stack) or (is_narrowband and dof_count == 0)
+        mod = 0.7   # Single master — moderate
 
     debug(
-        f"Denoise [{filter_name}]: {'ON' if apply else 'OFF'} "
-        f"(narrowband={is_narrowband}, frames={num_files}, dof={dof_count}/3, mod={mod if apply else '-'})"
+        f"Denoise [{filter_name}]: ON "
+        f"(broadband mono, frames={num_files}, dof={dof_count}/3, mod={mod})"
     )
-    return apply, mod
+    return True, mod
+
 
 def get_rmgreen_command(is_color: bool) -> str:
     """
