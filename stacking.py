@@ -323,15 +323,32 @@ def get_master_bias_path(session_dir: Path, filter_name: str | None = None) -> s
 # SUBSKY - Gradient Optimization
 # --------------------------------------------------------------------------
 def get_subsky_command(
+    filter_name: str,
+    num_files: int,
+    is_narrowband: bool,
     master_dark_path: str = None,
     master_flat_path: str = None,
-    master_bias_path: str = None
+    master_bias_path: str = None,
+    force_skip: bool = False,
 ) -> str:
     """
-    Adjust subsky parameters according to the available calibration quality.
-    Optimized to clean residual vignetting in corners in the absence of Flat,
-    while preserving the center of the image (no dark halo).
+    Returns a Siril 1.2 subsky command calibrated to the imaging context.
+
+    SubSky risks on deep or low-surface-brightness data:
+      - Deep narrowband (SII, faint OIII): signal fills the frame → background
+        samples are contaminated → RBF creates a negative bowl around the nebula.
+      - IFN (Integrated Flux Nebulae): the "background" is the signal itself —
+        subsky will destroy the very data we are trying to preserve.
+      - Flat-corrected data: the flat already corrects optical vignetting;
+        aggressive subsky then over-subtracts and creates halos.
+
+    Safe rule: if a flat is present AND the stack is deep narrowband,
+    skip subsky entirely (flat handles vignetting, stack handles noise).
+    For all other cases, apply RBF/polynomial adapted to available calibration.
     """
+    if force_skip:
+        debug("Subsky: skipped (force_skip=True)")
+        return ""
 
     missing = []
     if not master_dark_path: missing.append("dark")
@@ -339,30 +356,50 @@ def get_subsky_command(
     if not master_bias_path: missing.append("bias")
 
     debug(f"=== Subsky Masters Check ===")
-    debug(f"  Master Dark:  {'SET' if master_dark_path else 'MISSING'} ({master_dark_path})")
-    debug(f"  Master Flat:  {'SET' if master_flat_path else 'MISSING'} ({master_flat_path})")
-    debug(f"  Master Bias:  {'SET' if master_bias_path else 'MISSING'} ({master_bias_path})")
+    debug(f"  Filter: {filter_name} | NB: {is_narrowband} | Frames: {num_files}")
+    debug(f"  Master Dark:  {'SET' if master_dark_path else 'MISSING'}")
+    debug(f"  Master Flat:  {'SET' if master_flat_path else 'MISSING'}")
+    debug(f"  Master Bias:  {'SET' if master_bias_path else 'MISSING'}")
     debug(f"  Missing: {missing}")
 
-    has_flat = "flat" not in missing
-    nb_missing = len(missing)
+    has_flat     = "flat" not in missing
+    nb_missing   = len(missing)
 
-    # Base parameters depending on flat availability
+    # ------------------------------------------------------------------
+    # CASE 1: Flat available
+    # The flat already corrects optical vignetting. SubSky should only
+    # handle residual sky gradient (light pollution, atmospheric gradients).
+    # ------------------------------------------------------------------
     if has_flat:
-        base_cmd = 'subsky -rbf'
-        common_params = '-smooth=0.4 -samples=50'
+        # Deep narrowband with flat: flat corrects everything optical.
+        # Subsky on a filled-frame SII/OIII risks clipping the outer signal.
+        if is_narrowband and num_files >= 30:
+            debug("Subsky: disabled — deep narrowband with flat (flat handles vignetting)")
+            return ""
+
+        # Flat available, not deep narrowband: gentle RBF to handle sky gradient.
+        # High smooth prevents over-fitting around bright objects.
         tolerance = 1.2 if nb_missing == 0 else 1.4
-        return f'{base_cmd} -tolerance={tolerance} {common_params}'
+        smooth    = 0.6 if nb_missing == 0 else 0.7
+        return f'subsky -rbf -tolerance={tolerance} -smooth={smooth} -samples=50'
+
+    # ------------------------------------------------------------------
+    # CASE 2: No flat
+    # Without flat, optical vignetting persists after calibration.
+    # SubSky must correct both vignetting and sky gradient.
+    # Use RBF (better for radial vignetting) with smooth tuned to stack depth.
+    # ------------------------------------------------------------------
+    if nb_missing == 1:
+        # Dark only — decent calibration, moderate correction
+        return 'subsky 3 -tolerance=1.4 -samples=60'
+    elif nb_missing == 2:
+        # Missing flat + one other: RBF to handle radial patterns
+        return 'subsky -rbf -tolerance=1.5 -smooth=0.7 -samples=60'
     else:
-        base_cmd = 'subsky'
-        degree = 3
-        if nb_missing == 1:
-            tolerance, samples = 1.4, 60
-            return f'{base_cmd} {degree} -tolerance={tolerance} -samples={samples}'
-        elif nb_missing == 2:
-            return 'subsky -rbf -tolerance=1.5 -smooth=0.7 -samples=60'
-        else:
-            return 'subsky -rbf -tolerance=1.3 -smooth=0.9 -samples=70'
+        # No DOF at all: high smooth to prevent dark halo at center
+        return 'subsky -rbf -tolerance=1.3 -smooth=0.9 -samples=70'
+
+
 
 def get_color_calibration_command(
     is_color: bool,
@@ -659,7 +696,7 @@ def generate_siril_stack_script(
     if num_files < 6:
         rejection = "sigma"
         sigmas = "3 3"
-    elif num_files >= 50:
+    elif num_files >= 100:
         rejection = "linear"
         sigmas = "3 3"
     else:
@@ -748,7 +785,14 @@ def generate_siril_stack_script(
     )
 
     lines.extend([
-        get_subsky_command(master_dark_path, master_flat_path, master_bias_path),
+        get_subsky_command(
+            filter_name,
+            num_files,
+            is_narrowband,
+            master_dark_path,
+            master_flat_path,
+            master_bias_path
+        ),
         get_color_calibration_command(is_color, filter_name, light_files or []),
         get_rmgreen_command(is_color),
         f"denoise -da3d -mod={denoise_mod}" if apply_denoise else "",
@@ -1173,12 +1217,41 @@ def get_image_dimensions(ref_path: Path) -> tuple:
         debug(f"Warning: Could not read dimensions of {ref_path}, fallback 2048x2048")
         return (2048, 2048)
 
-def correct_image_orientation(image_path: Path):
-    """Vertically flip the final image to compensate for FITS coordinate system (origin at bottom-left)."""
+
+def correct_image_orientation(image_path: Path, fits_source_path: Path = None) -> None:
+    """
+    Flip the image vertically to correct FITS bottom-up storage convention.
+
+    FITS standard stores image rows starting from the bottom (ROWORDER=BOTTOM-UP).
+    Siril preserves this in its stacked output. The flip is needed to display
+    the image in the conventional screen orientation (top-left origin).
+
+    If a source FITS is provided and its ROWORDER header says TOP-DOWN,
+    the flip is skipped — the image is already in the correct orientation.
+    Default behavior (no FITS available or no ROWORDER header): always flip.
+    """
+    needs_flip = True  # safe default: assume FITS BOTTOM-UP convention
+
+    if fits_source_path and fits_source_path.exists():
+        try:
+            with fits.open(fits_source_path, mode='readonly',
+                           ignore_missing_end=True) as hdul:
+                roworder = hdul[0].header.get('ROWORDER', 'BOTTOM-UP').upper()
+                needs_flip = 'BOTTOM' in roworder
+                debug(f"Orientation: ROWORDER={roworder} → flip={needs_flip}")
+        except Exception as e:
+            debug(f"Orientation: could not read ROWORDER ({e}), defaulting to flip")
+
+#     if not needs_flip:
+#         return
+
+    cmd = ["convert", str(image_path), "-flip", str(image_path)]
     try:
-        subprocess.run(["convert", str(image_path), "-flip", str(image_path)], check=True)
-    except Exception as e:
-        debug(f"Orientation correction failure: {e}")
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except subprocess.CalledProcessError as e:
+        debug(f"Orientation flip failed: {e}")
+
+
 
 # --------------------------------------------------------------------------
 # IMAGE ALIGNMENT WITH SIRIL-CLI
@@ -1617,7 +1690,8 @@ def run(args) -> bool:
     if composite_success:
         final_image = current_session_dir / f"{file_prefix}_full.{format_requested}"
         if final_image.is_file():
-            correct_image_orientation(final_image)
+            last_stacked = next(iter(master_files_map.values()), None)
+            correct_image_orientation(final_image, fits_source_path=last_stacked)
             emit("done", data={
                 "uuid": session_uuid,
                 "output_format": format_requested,
