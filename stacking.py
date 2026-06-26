@@ -46,6 +46,10 @@ VERBOSE = False
 DSO_NAME = ''
 VALID_EXTENSIONS = {'.fits', '.fit', '.fts', '.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}
 DENOISE_FRAME_THRESHOLD = 30
+USE_PCC = False          # Set to True only if NOMAD catalog is installed locally
+SIRIL_VERSION_MAJOR = 1
+SIRIL_VERSION_MINOR = 2 # Set to 4 when upgrading to enable cc -nostellar
+
 
 def debug(message: str):
     if VERBOSE:
@@ -400,28 +404,23 @@ def get_subsky_command(
         return 'subsky -rbf -tolerance=1.3 -smooth=0.9 -samples=70'
 
 
-
 def get_color_calibration_command(
     is_color: bool,
     filter_name: str,
     light_files: list,
 ) -> str:
     """
-    Returns a Siril 1.2 color calibration command for OSC broadband data only.
+    Returns a Siril color calibration command for OSC broadband data only.
 
-    Siril 1.2 only supports pcc (Photometric Color Calibration) as a scriptable
-    color calibration command. cc -nostellar does not exist until Siril 1.4.
+    Siril 1.2: only `pcc` is scriptable, requires NOMAD catalog (network or local).
+    Siril 1.4: `cc -nostellar` is available without network or catalog.
 
-    pcc requires either:
-      - A pre-plate-solved image (WCS in FITS header), OR
-      - Explicit coordinates + focal length + pixel size for on-the-fly plate solving
-
-    Both cases require network access to download the star catalog (NOMAD by default).
-    If the network is unavailable, pcc fails silently and no calibration is applied.
-
-    Never apply color calibration on:
-      - Mono camera data (no color channels)
-      - Narrowband filters (monochromatic signal — cc would corrupt filter ratios)
+    Never apply on:
+      - Mono camera (no color channels to balance)
+      - Narrowband filters (monochromatic signal — calibration corrupts ratios)
+      - L/LUMINANCE on OSC (same as CLEAR — excluded by is_color=True check
+        being sufficient; the explicit LUMINANCE exclusion was incorrect and
+        prevented calibration for OSC+L sessions)
     """
     if not is_color:
         return ""
@@ -429,10 +428,12 @@ def get_color_calibration_command(
     if filter_name.upper() in NARROWBAND_FILTERS:
         return ""
 
-    # Attempt to read optical metadata from the first light FITS header.
-    # focal length and pixel size allow pcc to plate-solve on-the-fly
-    # if no WCS solution is already present in the stacked image.
-    if light_files:
+    # Siril 1.4+: cc -nostellar works without network or catalog
+    if SIRIL_VERSION_MAJOR >= 1 and SIRIL_VERSION_MINOR >= 4:
+        return "cc -nostellar"
+
+    # Siril 1.2: pcc requires NOMAD catalog
+    if USE_PCC and light_files:
         try:
             with fits.open(
                 light_files[0],
@@ -445,22 +446,21 @@ def get_color_calibration_command(
 
                 if focal and pixel_size:
                     debug(f"PCC: focal={int(focal)}mm pixel={float(pixel_size)}µm")
-                    # -noflip: stacked images are not expected to need flipping
-                    # -downscale: faster star detection on large OSC images
-#                     return (
-#                         f"pcc -focal={int(focal)}"
-#                         f" -pixelsize={float(pixel_size)}"
-#                         f" -noflip"
-#                         f" -downscale"
-#                     )
-                    return ""
+                    return (
+                        f"pcc -focal={int(focal)}"
+                        f" -pixelsize={float(pixel_size)}"
+                        f" -noflip -downscale"
+                    )
         except Exception as e:
             debug(f"PCC metadata read failed ({e}), skipping color calibration")
 
-    # Fallback: attempt pcc without optical metadata (relies on existing WCS)
-    debug("PCC: no focal/pixelsize metadata found, attempting pcc with existing WCS")
-#     return "pcc -noflip -downscale"
+        return "pcc -noflip -downscale"  # fallback: rely on existing WCS
+
+    # Siril 1.2 without USE_PCC: no scriptable color calibration available
+    debug("Color calibration: skipped (Siril 1.2, USE_PCC=False)")
     return ""
+
+
 
 def should_apply_denoise(
     filter_name: str,
@@ -494,53 +494,37 @@ def should_apply_denoise(
 
     # --- PRIORITY EXCLUSIONS ---
 
-    # Color camera: never — OSC channel denoise creates imbalance
+    # Color OSC: never
     if is_color:
-        debug(f"Denoise [{filter_name}]: OFF — color OSC camera")
+        debug(f"Denoise [{filter_name}]: OFF — color OSC")
         return False, 0.0
 
-    # Narrowband: never — faint signal is indistinguishable from noise
-    # pre-stretch; DA3D will destroy filaments, IFN halos, outer shell extensions.
-    # This applies to single-filter narrowband too (not just multi-filter).
+    # Narrowband: never — faint filaments would be smoothed out
     is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
     if is_narrowband:
         debug(f"Denoise [{filter_name}]: OFF — narrowband (faint structure risk)")
         return False, 0.0
 
-    # Multi-filter narrowband palette: green cast risk
+    # Multi-filter palette: never — green cast risk
     active_narrowband = [f for f in all_detected_filters if f in NARROWBAND_FILTERS]
     if len(active_narrowband) > 1:
-        debug(f"Denoise [{filter_name}]: OFF — multi-filter palette {active_narrowband}")
+        debug(f"Denoise [{filter_name}]: OFF — multi-filter palette")
         return False, 0.0
 
-    # --- ACTIVATION CONDITIONS ---
-    has_dark = bool(master_dark_path)
-    has_flat = bool(master_flat_path)
-    has_bias = bool(master_bias_path)
+    # Broadband mono: ONLY on very short stacks where noise dominates
+    # Normal stacks (>= 5 frames) average noise naturally — DA3D not needed
+    if num_files >= 5:
+        debug(f"Denoise [{filter_name}]: OFF — broadband, enough frames to average noise")
+        return False, 0.0
+
+    # Very short broadband stack (< 5 frames): light denoise
+    has_dark  = bool(master_dark_path)
+    has_flat  = bool(master_flat_path)
+    has_bias  = bool(master_bias_path)
     dof_count = sum([has_dark, has_flat, has_bias])
 
-    # Require minimum frames and at least one calibration master
-    if num_files < DENOISE_FRAME_THRESHOLD or dof_count == 0:
-        debug(
-            f"Denoise [{filter_name}]: OFF — "
-            f"insufficient frames ({num_files}<{DENOISE_FRAME_THRESHOLD}) "
-            f"or no calibration masters"
-        )
-        return False, 0.0
-
-    # --- MOD CALCULATION based on calibration quality ---
-    # More DOF available = less residual noise = lighter touch needed
-    if dof_count == 3:
-        mod = 0.4   # Complete calibration — light touch
-    elif dof_count == 2:
-        mod = 0.55
-    else:
-        mod = 0.7   # Single master — moderate
-
-    debug(
-        f"Denoise [{filter_name}]: ON "
-        f"(broadband mono, frames={num_files}, dof={dof_count}/3, mod={mod})"
-    )
+    mod = 0.85 if dof_count == 0 else 0.7
+    debug(f"Denoise [{filter_name}]: ON (very short broadband, frames={num_files}, mod={mod})")
     return True, mod
 
 
@@ -704,10 +688,14 @@ def generate_siril_stack_script(
 
     # -------------------------------------------------------------------------
     # REJECTION METHOD
-    # sigma      < 6 frames  : Winsorized unstable with few data points
-    # winsorized 6–49 frames : good balance robustness/performance
-    # linear     >= 100 frames: Linear Fit Clipping, better on large stacks
+    # ≤ 3 frames : no rejection — Sigma/Winsorized are statistically undefined
+    #              with so few data points and risk leaving 0 usable frames.
+    #              Simple mean (no rej keyword) is the only safe option.
+    # 4–5 frames : Sigma with wide bounds (4σ) — light outlier rejection only
+    # 6–49 frames: Winsorized — robust balance for typical EAA stacks
+    # ≥ 100 frames: Linear Fit Clipping — best for large, varied-quality stacks
     # -------------------------------------------------------------------------
+
     if num_files <= 3:
         rejection     = None      # no rejection at all
         sigmas        = None
@@ -1055,24 +1043,30 @@ def compose_rgb_image(
     elif has_clear and has_rgb:
         debug(f"Palette: LRGB (key={clear_key})")
         cmd = ["convert",
-            # Build the RGB color base
-            "(", chan("RED"), chan("GREEN"), chan("BLUE"),
-                "-combine", "-colorspace", "sRGB",
-                "-colorspace", "LAB",
+            # Extract Hue channel from the RGB base
+            "(",
+                "(", chan("RED"), chan("GREEN"), chan("BLUE"),
+                    "-combine", "-colorspace", "sRGB",
+                ")",
+                "-colorspace", "HSL",
+                "-channel", "R", "-separate", "+channel",
             ")",
-            # Force L channel to 3-channel to avoid grayscale compositing issues
-            "(", str(tif_files[clear_key]),
-                "-colorspace", "gray",
-                "-colorspace", "RGB",   # expand to 3 channels
-                "-colorspace", "LAB",
+            # Extract Saturation channel from the RGB base
+            "(",
+                "(", chan("RED"), chan("GREEN"), chan("BLUE"),
+                    "-combine", "-colorspace", "sRGB",
+                ")",
+                "-colorspace", "HSL",
+                "-channel", "G", "-separate", "+channel",
             ")",
-            # Replace L* (= R channel in LAB) with dedicated luminance channel
-            "-channel", "R",
-            "-compose", "Copy",           # in HSL, Lightness = Red slot
-            "-composite",
-            "+channel",
-            # Convert back to sRGB for final output
-            "-colorspace", "sRGB",
+            # Dedicated Luminance channel
+            str(tif_files[clear_key]),
+            # CRITICAL: -set colorspace HSL DECLARES the colorspace without converting.
+            # Using -colorspace HSL here would CONVERT [H,S,L] data as if it were sRGB
+            # → completely wrong color mapping → the red/noisy catastrophe observed.
+            "-combine",
+            "-set", "colorspace", "HSL",    # ← déclaration, PAS conversion
+            "-colorspace", "sRGB",           # ← conversion HSL→sRGB
         ]
         palette_label = "LRGB"
 
@@ -1192,8 +1186,14 @@ def compose_rgb_image(
         cmd.extend([
             "-level", "1%,98%",
             "-sigmoidal-contrast", "4x50%",
-#             "-unsharp", "0x1.0+0.5+0.02",
             "-unsharp", "0x1.2+0.8+0.05",
+            # OSC background neutralization (approximate cc -nostellar equivalent).
+            # Sample the corners (sky background) and normalize each channel
+            # to correct the RGGB Bayer red-channel dominance on emission nebulae.
+            # This is a best-effort correction for Siril 1.2 where cc is unavailable.
+            "-region", "100x100+0+0",
+            "-auto-level",
+            "+region",
         ])
 
     elif palette_label == "CLEAR":
@@ -1585,8 +1585,22 @@ def run(args) -> bool:
              }
         })
 
-        first_filter_is_color = is_color_camera(first_fits_file)
-        emit("progress", data={"step": "sensor_type", "type": "color" if first_filter_is_color else "mono"})
+        first_file_for_filter = sorted(files_by_filter[current_filter])[0]
+        filter_is_color = is_color_camera(first_file_for_filter)
+        # Reclassify L/LUMINANCE as CLEAR for OSC cameras:
+        # OSC cameras don't do dedicated LRGB luminance — 'L' filter means
+        # "unfiltered" (= CLEAR). Only mono cameras produce true L channels.
+        effective_filter = current_filter
+        if filter_is_color and current_filter in ("LUMINANCE", "L"):
+            effective_filter = "CLEAR"
+            debug(f"Reclassified {current_filter} → CLEAR (OSC camera, unfiltered)")
+
+        emit("progress", data={
+            "step": "sensor_type",
+            "filter": current_filter,
+            "type": "color" if filter_is_color else "mono"
+        })
+
 
         filter_work_dir = current_session_dir / f"work_{current_filter}"
         filter_work_dir.mkdir(parents=True, exist_ok=True)
@@ -1609,9 +1623,9 @@ def run(args) -> bool:
         # Generate and execute stacking script
         stack_script = generate_siril_stack_script(
             filter_work_dir,
-            current_filter,
+            effective_filter,
             num_files,
-            first_filter_is_color,
+            filter_is_color,
             detected_filters,
             master_dark_path,
             master_flat_path,
