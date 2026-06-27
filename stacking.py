@@ -461,6 +461,75 @@ def get_color_calibration_command(
     return ""
 
 
+# --------------------------------------------------------------------------
+# SEQSUBSKY — per-frame background extraction before stacking
+# --------------------------------------------------------------------------
+# Configuration constants (add near top of file with other constants)
+SEQSUBSKY_ENABLED      = True   # Set to False to revert to post-stack subsky only
+SEQSUBSKY_SAMPLES_NB   = 30     # Fewer samples: narrowband frames are noisy
+SEQSUBSKY_SAMPLES_BB   = 20     # Broadband frames: background is more uniform
+SEQSUBSKY_TOLERANCE_NB = 2.0    # High tolerance: signal fills the frame on deep NB
+SEQSUBSKY_TOLERANCE_BB = 1.5    # Standard broadband tolerance
+SEQSUBSKY_SMOOTH       = 0.6    # Smooth RBF to avoid over-subtracting noise patterns
+
+
+def get_seqsubsky_command(
+    seq_name: str,
+    filter_name: str,
+    is_narrowband: bool,
+    num_files: int,
+    master_flat_path: str = None,
+) -> tuple[str, str]:
+    """
+    Returns (siril_command, output_seq_name) for per-frame background extraction.
+
+    seqsubsky creates a new sequence prefixed with 'bkg_':
+        pp_light    → bkg_pp_light
+        pp_pp_light → bkg_pp_pp_light
+
+    Operating on individual frames (vs post-stack subsky) requires adjusted
+    parameters: individual frames are noisier, so sample counts are lower
+    and tolerances are higher than on the stacked image.
+
+    Narrowband: signal fills the frame → very high tolerance to prevent
+    the RBF model from fitting to the nebula instead of the background.
+    Broadband: reliable background samples available in corners.
+
+    With flat: the flat already corrects optical vignetting → tighter
+    tolerance is safe. Without flat: tolerance must be higher to handle
+    the combined vignetting + sky gradient without over-subtracting.
+    """
+    if not SEQSUBSKY_ENABLED:
+        return "", seq_name
+
+    has_flat = bool(master_flat_path)
+
+    if is_narrowband:
+        # Deep narrowband: high tolerance protects signal-rich regions.
+        # Extra smooth prevents the RBF from fitting extended emission.
+        tolerance = SEQSUBSKY_TOLERANCE_NB
+        samples   = SEQSUBSKY_SAMPLES_NB
+        smooth    = max(SEQSUBSKY_SMOOTH, 0.75)
+    else:
+        # Broadband: standard parameters, slightly tighter with flat available
+        tolerance = SEQSUBSKY_TOLERANCE_BB if not has_flat else 1.2
+        samples   = SEQSUBSKY_SAMPLES_BB
+        smooth    = SEQSUBSKY_SMOOTH
+
+    cmd = (
+        f"seqsubsky {seq_name}"
+        f" -rbf"
+        f" -tolerance={tolerance}"
+        f" -smooth={smooth}"
+        f" -samples={samples}"
+    )
+    output_seq = f"bkg_{seq_name}"
+
+    debug(
+        f"seqsubsky [{filter_name}]: {seq_name} → {output_seq} "
+        f"(tolerance={tolerance}, smooth={smooth}, samples={samples})"
+    )
+    return cmd, output_seq
 
 def should_apply_denoise(
     filter_name: str,
@@ -681,10 +750,28 @@ def generate_siril_stack_script(
         lines.append(" ".join(cal_cmd))
         seq = "pp_light"
 
-    # 2. Pre-processing (Debayering)
+    # 2. Debayering (OSC only)
     if is_color:
         lines.append(f"preprocess {seq} -debayer")
         seq = f"pp_{seq}"
+
+    # 3. Per-frame background extraction
+    # seqsubsky removes the sky gradient from each individual frame before
+    # stacking. This is more accurate than post-stack subsky because each
+    # frame has its own sky level (changing conditions, atmospheric gradients).
+    # Output sequence is prefixed with 'bkg_' by Siril convention.
+    seqsubsky_cmd, seq = get_seqsubsky_command(
+        seq,
+        filter_name,
+        is_narrowband,
+        num_files,
+        master_flat_path,
+    )
+    if seqsubsky_cmd:
+        lines.append(seqsubsky_cmd)
+
+    # 4. Registration
+    lines.append(f"register {seq}")
 
     # -------------------------------------------------------------------------
     # REJECTION METHOD
@@ -695,7 +782,6 @@ def generate_siril_stack_script(
     # 6–49 frames: Winsorized — robust balance for typical EAA stacks
     # ≥ 100 frames: Linear Fit Clipping — best for large, varied-quality stacks
     # -------------------------------------------------------------------------
-
     if num_files <= 3:
         rejection     = None      # no rejection at all
         sigmas        = None
@@ -761,8 +847,8 @@ def generate_siril_stack_script(
     elif is_narrowband and not (filter_name.upper() == "SII") and num_files >= 10:
         # HA and OIII still have some stars → more permissive filter
         filters.append("-filter-wfwhm=90%")
-
     filter_str = " ".join(filters)
+
     if rejection is None:
         stack_cmd = f"stack r_{seq} -norm=addscale"
     else:
@@ -775,12 +861,12 @@ def generate_siril_stack_script(
     ]
 
     lines.extend([
-        f'register {seq}',
+#        f'register {seq}',
         " ".join(p for p in stack_parts if p),
-        f'load r_{seq}_stacked.fit',
+        f"load r_{seq}_stacked.fit",
     ])
 
-    # 4. Post-processing (linear data, before stretch)
+    # 8. Post-stack processing
     apply_denoise, denoise_mod = should_apply_denoise(
         filter_name, num_files, is_color,
         all_detected_filters,
@@ -793,15 +879,24 @@ def generate_siril_stack_script(
         any([master_dark_path, master_flat_path, master_bias_path])
     )
 
+    # Post-stack subsky: disabled when seqsubsky ran (per-frame extraction
+    # already handled the gradient; double-subsky creates halos).
+    # Still active when seqsubsky is disabled (SEQSUBSKY_ENABLED=False).
+    post_stack_subsky = "" if seqsubsky_cmd else get_subsky_command(
+        filter_name, num_files, is_narrowband,
+        master_dark_path, master_flat_path, master_bias_path
+    )
+
     lines.extend([
-        get_subsky_command(
-            filter_name,
-            num_files,
-            is_narrowband,
-            master_dark_path,
-            master_flat_path,
-            master_bias_path
-        ),
+#        get_subsky_command(
+#            filter_name,
+#            num_files,
+#            is_narrowband,
+#            master_dark_path,
+#            master_flat_path,
+#            master_bias_path
+#        ),
+        post_stack_subsky,
         get_color_calibration_command(is_color, filter_name, light_files or []),
         get_rmgreen_command(is_color),
         f"denoise -da3d -mod={denoise_mod}" if apply_denoise else "",
@@ -1644,13 +1739,13 @@ def run(args) -> bool:
         seq_count  = len(list(filter_work_dir.glob("*.seq")))
         debug(f"=== work_{current_filter}: {fits_count} FITS, {seq_count} SEQ ===")
 
-        stacked_file = current_session_dir / f"stacked_{current_filter}.fit"
+        stacked_file = current_session_dir / f"stacked_{effective_filter}.fit"
         if stacked_file.exists():
             size_kb = stacked_file.stat().st_size / 1024
             debug(f"✅ Stacked file found: {stacked_file.name} ({size_kb:.1f} KB)")
         else:
             debug(f"❌ Missed stacked file: {stacked_file.name}")
-            success = False  # ✅ Force failure if no file
+            success = False
 
         if not success:
             emit("error", data={"step": "stacking_failed", "filter": current_filter})
@@ -1659,8 +1754,8 @@ def run(args) -> bool:
             continue
 
         emit("progress", data={"step": "stacking_done", "filter": current_filter})
-        siril_default_fit = current_session_dir / f"stacked_{current_filter}.fit"
-        custom_fit_name = current_session_dir / f"{file_prefix}_{current_filter}.fit"
+        siril_default_fit = current_session_dir / f"stacked_{effective_filter}.fit"
+        custom_fit_name   = current_session_dir / f"{file_prefix}_{current_filter}.fit"
 
         if siril_default_fit.is_file():
             if custom_fit_name.exists():
@@ -1668,7 +1763,7 @@ def run(args) -> bool:
             siril_default_fit.rename(custom_fit_name)
             master_files_map[current_filter] = custom_fit_name
         else:
-            debug(f"⚠️ stacked_{current_filter}.fit not found after stacking")
+            debug(f"⚠️ stacked_{effective_filter}.fit not found after stacking")
 
         if filter_work_dir.is_dir():
             shutil.rmtree(filter_work_dir)
