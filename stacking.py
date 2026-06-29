@@ -46,7 +46,7 @@ VERBOSE = False
 DSO_NAME = ''
 VALID_EXTENSIONS = {'.fits', '.fit', '.fts', '.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}
 DENOISE_FRAME_THRESHOLD = 30
-USE_PCC = False          # Set to True only if NOMAD catalog is installed locally
+USE_PCC = False
 SIRIL_VERSION_MAJOR = 1
 SIRIL_VERSION_MINOR = 2 # Set to 4 when upgrading to enable cc -nostellar
 
@@ -55,10 +55,9 @@ def debug(message: str):
     if VERBOSE:
         print(f"[DEBUG] {message}", flush=True)
 
-def emit(status: str, data: dict = None, params: dict = None):
+def emit(status: str, step: str, params: dict = None):
     """Emit a JSON message to stderr for IPC with Symfony API."""
-    payload = {"status": status}
-    if data: payload["data"] = data
+    payload = {"status": status, "step": step}
     if params: payload["params"] = params
     print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
 
@@ -76,13 +75,17 @@ def get_fits_header(fits_path: Path) -> dict:
 
 def is_color_camera(fits_path: Path) -> bool:
     """Analyze FITS header to determine if sensor is color (OSC)."""
+    emit("progress", "is_color_camera_started", params={"file": fits_path.name})
+
     if fits_path.suffix.lower() in {'.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}:
         debug(f"RAW file detected ({fits_path.suffix}) → color camera assumed")
+        emit("progress", "is_color_camera_done", params={"result": True, "reason": "raw_extension"})
         return True
 
     header = get_fits_header(fits_path)
     if not header:
         debug(f"⚠️ No FITS headers, default MONO")
+        emit("progress", "is_color_camera_done", params={"result": False, "reason": "no_header"})
         return False
 
     debug(f"=== Sensor Detection ===")
@@ -94,17 +97,21 @@ def is_color_camera(fits_path: Path) -> bool:
 
     if 'BAYERPAT' in header or 'XBAYROFF' in header or 'CFAHEADER' in header:
         debug(f"  → Result: COLOR (Bayer detected)")
+        emit("progress", "is_color_camera_done", params={"result": True, "reason": "bayer_pattern"})
         return True
 
     instrument = header.get('INSTRUME', '').upper()
     if 'MC' in instrument and 'MM' not in instrument:
         debug(f"  → Result: COLOR (instrument MC)")
+        emit("progress", "is_color_camera_done", params={"result": True, "reason": "instrument_mc"})
         return True
 
     if header.get('COLOR', '') == 'YES':
         debug(f"  → Result: COLOR (keyword COLOR=YES)")
+        emit("progress", "is_color_camera_done", params={"result": True, "reason": "color_keyword"})
         return True
 
+    emit("progress", "is_color_camera_done", params={"result": False, "reason": "no_color_indicator"})
     return False
 
 def get_fits_bitdepth(fits_path: Path) -> int:
@@ -113,31 +120,39 @@ def get_fits_bitdepth(fits_path: Path) -> int:
     BITPIX=16 → 16-bit signed integer
     BITPIX=-32 → float32, BITPIX=-64 → float64 → 32-bit
     """
-    # RAW files → Siril conve'rts to 16-bit FITS
+    emit("progress", "get_fits_bitdepth_started", params={"file": fits_path.name})
+
     if fits_path.suffix.lower() in {'.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}:
         debug(f"RAW file → assuming 16-bit output after Siril conversion")
+        emit("progress", "get_fits_bitdepth_done", params={"bitdepth": 16, "reason": "raw_file"})
         return 16
 
     try:
         with fits.open(fits_path, mode='readonly', ignore_missing_end=True) as hdul:
-            bitpix = hdul[0].header.get('BITPIX', -32)
+            bitpix   = hdul[0].header.get('BITPIX', -32)
             detected = 16 if bitpix == 16 else 32
             debug(f"BITPIX={bitpix} → {detected}-bit")
+            emit("progress", "get_fits_bitdepth_done", params={"bitdepth": detected, "bitpix": bitpix})
             return detected
     except Exception as e:
         debug(f"Unable to read bit depth from {fits_path}: {e}")
+        emit("progress", "get_fits_bitdepth_done", params={"bitdepth": 32, "reason": "read_error"})
         return 32
 
 # --------------------------------------------------------------------------
 # DOF (DARKS, FLATS, BIAS)
 # --------------------------------------------------------------------------
 def ensure_2d_master(master_path: Path) -> Path | None:
-    """Ensure the master is in the correct 2D FITS geometric format (Mono or CFA) for Siril CLI."""
+    """Ensure the master is in the correct 2D FITS geometric format for Siril CLI."""
+    emit("progress",  "ensure_2d_master_started", params={"file": master_path.name})
+
     if not master_path.exists():
+        emit("progress", "ensure_2d_master_done",params={"result": None, "reason": "file_not_found"})
         return None
 
     if master_path.suffix.lower() not in ('.fit', '.fits', '.fts'):
         debug(f"Non-FITS master, skipping 2D check: {master_path.name}")
+        emit("progress", "ensure_2d_master_done", params={"result": str(master_path.name), "reason": "non_fits"})
         return master_path
 
     output_path = master_path.parent / f"{master_path.stem}_2d.fit"
@@ -147,22 +162,26 @@ def ensure_2d_master(master_path: Path) -> Path | None:
             output_path.unlink()
         except Exception as e:
             debug(f"Unable to delete {output_path} : {e}")
+            emit("progress", "ensure_2d_master_done", params={"result": None, "reason": "delete_failed"})
             return None
 
     try:
         with fits.open(master_path) as hdul:
-            header = hdul[0].header.copy()
-            data = hdul[0].data
+            header        = hdul[0].header.copy()
+            data          = hdul[0].data
             if data is None:
                 debug(f"Empty data in {master_path.name}, skipping 2D normalization")
+                emit("progress", "ensure_2d_master_done", params={"result": None, "reason": "empty_data"})
                 return None
             original_dtype = data.dtype
+
         # If image was accidentally read or saved as RGB (3D)
         if data.ndim == 3:
             data = np.mean(data, axis=-1).astype(original_dtype)  # Clean merge to pure intensity
             header.add_comment('Master normalized to 2D structure')
         elif data.ndim != 2:
             debug(f"Invalid image structure for calibration: {data.ndim} dimensions")
+            emit("progress", "ensure_2d_master_done", params={"result": None, "reason": f"invalid_ndim_{data.ndim}"})
             return None
 
         header['NAXIS'] = 2
@@ -170,9 +189,11 @@ def ensure_2d_master(master_path: Path) -> Path | None:
             del header['NAXIS3']
 
         fits.writeto(output_path, data, header, overwrite=True)
+        emit("progress", "ensure_2d_master_done", params={"result": output_path.name})
         return output_path
     except Exception as e:
         debug(f"Failed to normalize FITS 2D for {master_path.name} : {e}")
+        emit("progress", "ensure_2d_master_done", params={"result": None, "reason": f"exception: {e}"})
         return None
 
 def _find_master_dof(
@@ -190,7 +211,14 @@ def _find_master_dof(
     Matches case variants: HA / Ha / ha / Ha (capitalize).
     Returns the most recently modified match.
     """
+    emit("progress", "find_master_dof_started", params={
+        "type":   generic_name,
+        "filter": filter_name or "generic",
+        "dir":    dof_dir.name,
+    })
+
     if not dof_dir.is_dir():
+        emit("progress", "find_master_dof_done",params={"type": generic_name, "found": False})
         return None
 
     def resolve_master(path: Path) -> str:
@@ -219,6 +247,7 @@ def _find_master_dof(
                 match = find_by_pattern(f"*FILTER-{variant}*{ext}")
                 if match:
                     debug(f"Filter-specific {generic_name} found: {match.name}")
+                    emit("progress", "find_master_dof_done", params={"type": generic_name, "found": True, "file": match.name, "method": "filter_specific"})
                     return resolve_master(match)
 
     # 2. Generic fallback : case variants of generic_name
@@ -239,12 +268,14 @@ def _find_master_dof(
             exact = dof_dir / f"{variant}{ext}"
             if exact.exists() and not exact.stem.endswith("_2d"):
                 debug(f"Generic {generic_name} found (exact): {exact.name}")
+                emit("progress", "find_master_dof_done", params={"type": generic_name, "found": True, "file": exact.name, "method": "generic_exact"})
                 return resolve_master(exact)
 
             # Glob with suffixes (e.g. masterDark_BIN-1_4656x3520_EXPOSURE-300.00s.fit)
             match = find_by_pattern(f"{variant}*{ext}")
             if match:
                 debug(f"Generic {generic_name} found (glob): {match.name}")
+                emit("progress", "find_master_dof_done", params={"type": generic_name, "found": True, "file": match.name, "method": "generic_glob"})
                 return resolve_master(match)
 
     # 3. Fallback : individual frames → stack on-the-fly
@@ -259,11 +290,16 @@ def _find_master_dof(
 
     if not raw_frames:
         debug(f"No {generic_name} found in {dof_dir}")
+        emit("progress", "find_master_dof_done", params={"type": generic_name, "found": False})
         return None
 
     dof_type = generic_name.replace("master_", "")   # "dark" | "flat" | "bias"
     debug(f"No pre-built {generic_name} — stacking {len(raw_frames)} individual frames on-the-fly")
-
+    emit("progress", "find_master_dof_onthefly_started", params={
+        
+        "type":   dof_type,
+        "frames": len(raw_frames),
+    })
 
     # Create a temp work subdir to isolate symlinks from originals
     work_subdir = dof_dir / f"work_{dof_type}"
@@ -303,9 +339,13 @@ def _find_master_dof(
         debug(f"✅ master_{dof_type}.fit generated ({len(raw_frames)} frames stacked)")
         # Cleanup work subdir
         shutil.rmtree(work_subdir, ignore_errors=True)
+        emit("progress", "find_master_dof_onthefly_done", params={"type": dof_type, "success": True})
+        emit("progress", "find_master_dof_done", params={"type": generic_name, "found": True, "file": master_output.name, "method": "on_the_fly"})
         return resolve_master(master_output)
 
     debug(f"⚠️ On-the-fly {dof_type} stacking failed — proceeding without master")
+    emit("progress", "find_master_dof_onthefly_done", params={"type": dof_type, "success": False})
+    emit("progress", "find_master_dof_done", params={"type": generic_name, "found": False})
     return None
 
 def get_master_dark_path(session_dir: Path, filter_name: str | None = None) -> str | None:
@@ -350,8 +390,15 @@ def get_subsky_command(
     skip subsky entirely (flat handles vignetting, stack handles noise).
     For all other cases, apply RBF/polynomial adapted to available calibration.
     """
+    emit("progress", "get_subsky_command_started", params={
+        
+        "filter": filter_name,
+        "frames": num_files,
+    })
+
     if force_skip:
         debug("Subsky: skipped (force_skip=True)")
+        emit("progress", "get_subsky_command_done", params={"filter": filter_name, "command": "", "reason": "force_skip"})
         return ""
 
     missing = []
@@ -366,8 +413,8 @@ def get_subsky_command(
     debug(f"  Master Bias:  {'SET' if master_bias_path else 'MISSING'}")
     debug(f"  Missing: {missing}")
 
-    has_flat     = "flat" not in missing
-    nb_missing   = len(missing)
+    has_flat   = "flat" not in missing
+    nb_missing = len(missing)
 
     # ------------------------------------------------------------------
     # CASE 1: Flat available
@@ -379,13 +426,16 @@ def get_subsky_command(
         # Subsky on a filled-frame SII/OIII risks clipping the outer signal.
         if is_narrowband and num_files >= 30:
             debug("Subsky: disabled — deep narrowband with flat (flat handles vignetting)")
+            emit("progress", "get_subsky_command_done", params={"filter": filter_name, "command": "", "reason": "deep_nb_with_flat"})
             return ""
 
         # Flat available, not deep narrowband: gentle RBF to handle sky gradient.
         # High smooth prevents over-fitting around bright objects.
         tolerance = 1.2 if nb_missing == 0 else 1.4
         smooth    = 0.6 if nb_missing == 0 else 0.7
-        return f'subsky -rbf -tolerance={tolerance} -smooth={smooth} -samples=50'
+        cmd = f'subsky -rbf -tolerance={tolerance} -smooth={smooth} -samples=50'
+        emit("progress", "get_subsky_command_done", params={"filter": filter_name, "command": cmd})
+        return cmd
 
     # ------------------------------------------------------------------
     # CASE 2: No flat
@@ -395,13 +445,16 @@ def get_subsky_command(
     # ------------------------------------------------------------------
     if nb_missing == 1:
         # Dark only — decent calibration, moderate correction
-        return 'subsky 3 -tolerance=1.4 -samples=60'
+        cmd = 'subsky 3 -tolerance=1.4 -samples=60'
     elif nb_missing == 2:
         # Missing flat + one other: RBF to handle radial patterns
-        return 'subsky -rbf -tolerance=1.5 -smooth=0.7 -samples=60'
+        cmd = 'subsky -rbf -tolerance=1.5 -smooth=0.7 -samples=60'
     else:
         # No DOF at all: high smooth to prevent dark halo at center
-        return 'subsky -rbf -tolerance=1.3 -smooth=0.9 -samples=70'
+        cmd = 'subsky -rbf -tolerance=1.3 -smooth=0.9 -samples=70'
+
+    emit("progress",  "get_subsky_command_done", params={"filter": filter_name, "command": cmd})
+    return cmd
 
 
 def get_color_calibration_command(
@@ -422,14 +475,23 @@ def get_color_calibration_command(
         being sufficient; the explicit LUMINANCE exclusion was incorrect and
         prevented calibration for OSC+L sessions)
     """
+    emit("progress", "get_color_calibration_command_started", params={
+        
+        "filter":   filter_name,
+        "is_color": is_color,
+    })
+
     if not is_color:
+        emit("progress", "get_color_calibration_command_done", params={"command": "", "reason": "mono_camera"})
         return ""
 
     if filter_name.upper() in NARROWBAND_FILTERS:
+        emit("progress", "get_color_calibration_command_done", params={"command": "", "reason": "narrowband_filter"})
         return ""
 
     # Siril 1.4+: cc -nostellar works without network or catalog
     if SIRIL_VERSION_MAJOR >= 1 and SIRIL_VERSION_MINOR >= 4:
+        emit("progress", "get_color_calibration_command_done", params={"command": "cc -nostellar", "reason": "siril_1.4"})
         return "cc -nostellar"
 
     # Siril 1.2: pcc requires NOMAD catalog
@@ -446,6 +508,7 @@ def get_color_calibration_command(
 
                 if focal and pixel_size:
                     debug(f"PCC: focal={int(focal)}mm pixel={float(pixel_size)}µm")
+                    emit("progress", "get_color_calibration_command_done", params={"command": cmd, "reason": "pcc_with_metadata"})
                     return (
                         f"pcc -focal={int(focal)}"
                         f" -pixelsize={float(pixel_size)}"
@@ -454,10 +517,12 @@ def get_color_calibration_command(
         except Exception as e:
             debug(f"PCC metadata read failed ({e}), skipping color calibration")
 
+        emit("progress", "get_color_calibration_command_done", params={"command": "pcc -noflip -downscale", "reason": "pcc_wcs_fallback"})
         return "pcc -noflip -downscale"  # fallback: rely on existing WCS
 
     # Siril 1.2 without USE_PCC: no scriptable color calibration available
     debug("Color calibration: skipped (Siril 1.2, USE_PCC=False)")
+    emit("progress", "get_color_calibration_command_done", params={"command": "", "reason": "siril_1.2_no_pcc"})
     return ""
 
 
@@ -499,7 +564,17 @@ def get_seqsubsky_command(
     tolerance is safe. Without flat: tolerance must be higher to handle
     the combined vignetting + sky gradient without over-subtracting.
     """
+
+    emit("progress", "get_seqsubsky_command_started", params={
+        
+        "filter":      filter_name,
+        "sequence":    seq_name,
+        "narrowband":  is_narrowband,
+        "frames":      num_files,
+    })
+
     if not SEQSUBSKY_ENABLED:
+        emit("progress", "get_seqsubsky_command_done", params={"command": "", "output_seq": seq_name, "reason": "disabled"})
         return "", seq_name
 
     has_flat = bool(master_flat_path)
@@ -529,7 +604,17 @@ def get_seqsubsky_command(
         f"seqsubsky [{filter_name}]: {seq_name} → {output_seq} "
         f"(tolerance={tolerance}, smooth={smooth}, samples={samples})"
     )
+    emit("progress", "get_seqsubsky_command_done", params={
+        
+        "filter":     filter_name,
+        "command":    cmd,
+        "output_seq": output_seq,
+        "tolerance":  tolerance,
+        "smooth":     smooth,
+        "samples":    samples,
+    })
     return cmd, output_seq
+
 
 def should_apply_denoise(
     filter_name: str,
@@ -563,27 +648,37 @@ def should_apply_denoise(
 
     # --- PRIORITY EXCLUSIONS ---
 
+    emit("progress", "should_apply_denoise_started", params={
+        
+        "filter": filter_name,
+        "frames": num_files,
+    })
+
     # Color OSC: never
     if is_color:
         debug(f"Denoise [{filter_name}]: OFF — color OSC")
+        emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": False, "reason": "color_osc"})
         return False, 0.0
 
     # Narrowband: never — faint filaments would be smoothed out
     is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
     if is_narrowband:
         debug(f"Denoise [{filter_name}]: OFF — narrowband (faint structure risk)")
+        emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": False, "reason": "narrowband"})
         return False, 0.0
 
     # Multi-filter palette: never — green cast risk
     active_narrowband = [f for f in all_detected_filters if f in NARROWBAND_FILTERS]
     if len(active_narrowband) > 1:
         debug(f"Denoise [{filter_name}]: OFF — multi-filter palette")
+        emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": False, "reason": "multi_filter_palette"})
         return False, 0.0
 
     # Broadband mono: ONLY on very short stacks where noise dominates
     # Normal stacks (>= 5 frames) average noise naturally — DA3D not needed
     if num_files >= 5:
         debug(f"Denoise [{filter_name}]: OFF — broadband, enough frames to average noise")
+        emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": False, "reason": "enough_frames"})
         return False, 0.0
 
     # Very short broadband stack (< 5 frames): light denoise
@@ -594,15 +689,15 @@ def should_apply_denoise(
 
     mod = 0.85 if dof_count == 0 else 0.7
     debug(f"Denoise [{filter_name}]: ON (very short broadband, frames={num_files}, mod={mod})")
+    emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": True, "mod": mod})
     return True, mod
 
 
 def get_rmgreen_command(is_color: bool) -> str:
-    """
-    Generate the noise removal command for green (SCNR).
-    Only relevant on color sensors.
-    """
-    return "rmgreen 0.3" if is_color else ""
+    cmd = "rmgreen 0.3" if is_color else ""
+    emit("progress", "get_rmgreen_command_done", params={"command": cmd})
+    return cmd
+
 
 def get_stretch_command(
     filter_name: str,
@@ -639,6 +734,14 @@ def get_stretch_command(
     │ Mono NB, short/no DOF   │ -2.8        │ 0.28     │
     └─────────────────────────┴─────────────┴──────────┘
     """
+    emit("progress", "get_stretch_command_started", params={
+        
+        "filter":      filter_name,
+        "is_color":    is_color,
+        "frames":      num_files,
+        "has_masters": has_masters,
+    })
+
     is_narrowband  = filter_name.upper() in NARROWBAND_FILTERS
     is_rgb_channel = filter_name.upper() in {"RED", "GREEN", "BLUE"}
     is_broadband   = filter_name.upper() in BROADBAND_FILTERS
@@ -648,6 +751,10 @@ def get_stretch_command(
     good_stack  = num_files >= 20 and has_masters
     medium_stack = num_files >= 8  and has_masters
     short_stack  = num_files < 6   or not has_masters
+
+    def _done(cmds):
+        emit("progress", "get_stretch_command_done", params={"filter": filter_name, "commands": cmds})
+        return cmds
 
     # ------------------------------------------------------------------
     # OSC COLOR CAMERA
@@ -659,19 +766,19 @@ def get_stretch_command(
         if is_narrowband:
             # OSC + narrowband clip (e.g. dual-band filter on color camera)
             # Signal is narrow-band but sensor is color — treat like mono NB
-            return ["autostretch -linked -2.8 0.15"]
+            return _done(["autostretch -linked -2.8 0.15"])
 
         # OSC broadband (CLEAR, no filter, UHC, CLS...)
         if good_stack:
             # Enough frames to trust SNR — aggressive clip, dark background
-            return ["autostretch -linked -3.0 0.20"]
+            return _done(["autostretch -linked -3.0 0.20"])
         elif medium_stack:
             # Moderate stack — balance between noise rejection and signal preservation
             return ["autostretch -linked -2.8 0.23"]
         else:
             # Short stack or no calibration — softer clip, brighter targetbg
             # Avoids clipping diffuse nebulosity (M16, M42, M31 outer halos)
-            return ["autostretch -linked -2.8 0.28"]
+            return _done(["autostretch -linked -2.8 0.28"])
 
     # ------------------------------------------------------------------
     # MONO CAMERA — RGB individual channels
@@ -679,21 +786,21 @@ def get_stretch_command(
     # when channels are later combined by compose_rgb_image.
     # ------------------------------------------------------------------
     if is_rgb_channel:
-        return ["autostretch -linked -2.8 0.25"]
+        return _done(["autostretch -linked -2.8 0.25"])
 
     # ------------------------------------------------------------------
     # MONO CAMERA — broadband (CLEAR, L, LUMINANCE)
     # ------------------------------------------------------------------
     if is_luminance:
         if good_stack:
-            return ["autostretch -linked -3.0 0.20"]
+            return _done(["autostretch -linked -3.0 0.20"])
         elif medium_stack:
-            return ["autostretch -linked -2.8 0.22"]
+            return _done(["autostretch -linked -2.8 0.22"])
         else:
-            return ["autostretch -linked -2.8 0.25"]
+            return _done(["autostretch -linked -2.8 0.25"])
 
     if is_broadband:
-        return ["autostretch -linked -2.8 0.25"]
+        return _done(["autostretch -linked -2.8 0.25"])
 
     # ------------------------------------------------------------------
     # MONO CAMERA — narrowband (HA, OIII, SII, H_BETA)
@@ -702,13 +809,14 @@ def get_stretch_command(
     # ------------------------------------------------------------------
     if good_stack:
         # Well-calibrated deep stack — push background dark to reveal faint filaments
-        return ["autostretch -linked -2.8 0.15"]
+        return _done(["autostretch -linked -2.8 0.15"])
     elif medium_stack:
         # Decent stack — moderate background
-        return ["autostretch -linked -2.8 0.20"]
+        return _done(["autostretch -linked -2.8 0.20"])
     else:
         # Short stack or missing masters — bright targetbg to avoid clipping signal
-        return ["autostretch -linked -2.8 0.28"]
+        return _done(["autostretch -linked -2.8 0.28"])
+
 
 # --------------------------------------------------------------------------
 # GENERATE NATIVE SIRIL SCRIPTS (.SSF)
@@ -729,6 +837,18 @@ def generate_siril_stack_script(
     Generates the .ssf script for Siril.
     num_files: used to validate that we have at least 2 images for the stack
     """
+
+    emit("progress", "generate_siril_stack_script_started", params={
+        
+        "filter":     filter_name,
+        "frames":     num_files,
+        "is_color":   is_color,
+        "has_dark":   bool(master_dark_path),
+        "has_flat":   bool(master_flat_path),
+        "has_bias":   bool(master_bias_path),
+        "output_bits": output_bits,
+    })
+
     abs_work_dir = filter_work_dir.resolve().as_posix()
     is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
     bit_cmd = "set32bits" if output_bits == 32 else "set16bits"
@@ -908,7 +1028,10 @@ def generate_siril_stack_script(
         "exit"
     ])
 
-    return "\n".join(line for line in lines if line)
+    script = "\n".join(line for line in lines if line)
+    emit("progress", "generate_siril_stack_script_done", params={"filter": filter_name, "lines": len(lines)})
+    return script
+
 
 def generate_siril_script(
     session_dir: Path,
@@ -920,11 +1043,17 @@ def generate_siril_script(
     Generate the intermediate FIT to TIFF conversion script.
     Uses the native 'savetif' command from Siril 1.2 to avoid erroneous hybrid files like '.tif.fit'.
     """
+
+    emit("progress", "generate_siril_script_started", params={
+        
+        "filter": filter_name,
+    })
+
     if fit_path is None:
         fit_path = session_dir / f"{file_prefix}_{filter_name}.fit"
     tif_path = (session_dir / f"{file_prefix}_{filter_name}").as_posix()
 
-    return "\n".join([
+    script = "\n".join([
         "requires 1.2.0",
         f'load "{fit_path.as_posix()}"',
         f'savetif "{tif_path}"',
@@ -932,11 +1061,17 @@ def generate_siril_script(
         "exit"
     ])
 
+    emit("progress", "generate_siril_script_done", params={"filter": filter_name, "output_tif": f"{file_prefix}_{filter_name}.tif"})
+    return script
+
+
 # --------------------------------------------------------------------------
 # CORE ENGINE EXECUTION (SIRIL-CLI)
 # --------------------------------------------------------------------------
 def run_siril_command(session_dir: Path, script_content: str, script_name: str, work_dir: Path = None) -> bool:
-    """Execute a user Siril script with siril-cli."""
+    """Execute a Siril script with siril-cli."""
+    emit("progress", "run_siril_command_started", params={"script": script_name})
+
     script_path = session_dir / script_name
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(script_content)
@@ -964,13 +1099,17 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
                 debug(f"[Siril LOG] {line.strip()}")
 
         process.wait()
-        return process.returncode == 0
+        success = process.returncode == 0
+        emit("progress", "run_siril_command_done", params={"script": script_name, "success": success, "returncode": process.returncode})
+        return success
     except Exception as e:
         debug(f"Fatal error running siril-cli: {e}")
+        emit("progress", "run_siril_command_done", params={"script": script_name, "success": False, "error": str(e)})
         return False
     finally:
         if script_path.exists():
             script_path.unlink()
+
 
 # --------------------------------------------------------------------------
 # CHROMINANCE & COMPOSITION VIA IMAGEMAGICK
@@ -1002,6 +1141,12 @@ def compose_rgb_image(
     mono passthrough so that broadband OSC images receive proper post-processing
     (sigmoidal contrast, sharpening) instead of being exported flat.
     """
+    emit("progress", "compose_rgb_image_started", params={
+               
+        "channels":     list(tif_files.keys()),
+        "output_format": output_format,
+    })
+
     output_file = session_dir / f"{file_prefix}_full.{output_format}"
 
     # Resolve reference geometry for synthetic black channels (xc:black)
@@ -1051,6 +1196,7 @@ def compose_rgb_image(
         if output_format in ["webp", "jpg"]:
             cmd.extend(["-quality", "95"])
         cmd.append(str(output_file))
+        emit("progress", "compose_rgb_image_done", params={"palette": "MONO", "success": True})
         try:
             result = subprocess.run(
                 cmd,
@@ -1061,6 +1207,7 @@ def compose_rgb_image(
             return result.returncode == 0
         except Exception as e:
             debug(f"ImageMagick Single Channel Failure: {e}")
+            emit("progress", "compose_rgb_image_done", params={"palette": "MONO", "success": False, "error": str(e)})
             return False
 
     # ------------------------------------------------------------------
@@ -1184,7 +1331,7 @@ def compose_rgb_image(
         cmd = ["convert", chan("RED"), chan("GREEN"), chan("BLUE")]
         palette_label = "RGB"
 
-    emit("progress", data={"step": "combine", "message": f"Selected palette: {palette_label}"})
+    emit("progress", "combine", params={"palette": palette_label, "message": f"Selected palette: {palette_label}"})
 
     # ------------------------------------------------------------------
     # FINALIZATION — combine channels then apply palette-specific
@@ -1309,6 +1456,8 @@ def compose_rgb_image(
 
     debug(f"ImageMagick [{palette_label}]: {' '.join(str(c) for c in cmd)}")
 
+    emit("progress", "imagemagick_started", params={"palette": palette_label})
+
     try:
         result = subprocess.run(
             cmd,
@@ -1318,10 +1467,16 @@ def compose_rgb_image(
         )
         if result.returncode != 0:
             debug(f"ImageMagick STDERR: {result.stderr}")
-        return result.returncode == 0
+        success = result.returncode == 0
+        emit("progress", "imagemagick_done", params={"palette": palette_label, "success": success})
+        emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": success})
+        return success
     except Exception as e:
         debug(f"ImageMagick composite assembly failure: {e}")
+        emit("progress", "imagemagick_done", params={      "palette": palette_label, "success": False, "error": str(e)})
+        emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": False, "error": str(e)})
         return False
+
 
 def get_image_dimensions(ref_path: Path) -> tuple:
     """Get real dimensions of the master FITS for ImageMagick."""
@@ -1346,7 +1501,9 @@ def correct_image_orientation(image_path: Path, fits_source_path: Path = None) -
     the flip is skipped — the image is already in the correct orientation.
     Default behavior (no FITS available or no ROWORDER header): always flip.
     """
-    needs_flip = True  # safe default: assume FITS BOTTOM-UP convention
+    emit("progress", "correct_image_orientation_started", params={"file": image_path.name})
+
+    needs_flip = True
 
     if fits_source_path and fits_source_path.exists():
         try:
@@ -1364,9 +1521,10 @@ def correct_image_orientation(image_path: Path, fits_source_path: Path = None) -
     cmd = ["convert", str(image_path), "-flip", str(image_path)]
     try:
         subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        emit("progress", "correct_image_orientation_done", params={"file": image_path.name, "flipped": True})
     except subprocess.CalledProcessError as e:
         debug(f"Orientation flip failed: {e}")
-
+        emit("progress", "correct_image_orientation_done", params={"file": image_path.name, "flipped": False, "error": str(e)})
 
 
 # --------------------------------------------------------------------------
@@ -1409,7 +1567,15 @@ def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Pa
         On failure, the original (unaligned) files remain in master_files_map
         and the pipeline continues without inter-filter alignment.
     """
+    emit("progress", "align_channels_started", params={
+            
+        "reference": ref_image.name if ref_image else None,
+        "to_align":  [img.name for img in images_to_align if img != ref_image],
+        "count":     len([img for img in images_to_align if img != ref_image]),
+    })
+
     if not images_to_align or not ref_image:
+        emit("progress", "align_channels_done", params={"success": False, "reason": "no_images_or_reference"})
         return False
 
     all_ok = True
@@ -1417,6 +1583,12 @@ def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Pa
     for img in images_to_align:
         if img == ref_image:
             continue
+
+        emit("progress", "channel_alignment_started", params={
+                
+            "channel":   img.stem,
+            "reference": ref_image.stem,
+        })
 
         work_dir = session_dir / f"_align_work_{img.stem}"
         src_dir  = work_dir / "src"
@@ -1464,19 +1636,24 @@ def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Pa
 
             if not success or not output_aligned.exists():
                 debug(f"⚠️ Alignment failed for {img.name}")
+                emit("progress", "channel_alignment_done", params={"channel": img.stem, "success": False})
                 all_ok = False
             else:
                 debug(f"✅ Aligned: {img.name} → {output_aligned.name}")
+                emit("progress", "channel_alignment_done", params={"channel": img.stem, "success": True, "output": output_aligned.name})
 
         except Exception as e:
             debug(f"❌ Unexpected error aligning {img.name}: {e}")
+            emit("progress", "channel_alignment_done", params={"channel": img.stem, "success": False, "error": str(e)})
             all_ok = False
 
         finally:
             # Always remove the work directory, even on failure
             shutil.rmtree(work_dir, ignore_errors=True)
 
+    emit("progress", "align_channels_done", params={"success": all_ok})
     return all_ok
+
 
 # --------------------------------------------------------------------------
 # IMAGE ALIGNMENT WITH ASTROALIGN (NOT CALLED)
@@ -1484,11 +1661,13 @@ def align_channels(session_dir: Path, images_to_align: list[Path], ref_image: Pa
 def align_images_with_astroalign(session_dir, filter_name, reference_path):
     """Align all images of a filter to a reference with Astroalign.
     """
+    emit("progress", "align_images_with_astroalign_started", params={"filter": filter_name})
     try:
         import astroalign as aa
         from astropy.nddata import CCDData
     except ImportError:
         debug("Astroalign not installed. Use 'pip install astroalign' to enable it.")
+        emit("progress", "align_images_with_astroalign_done", params={"success": False, "reason": "not_installed"})
         return False
 
     reference = CCDData.read(reference_path, unit='adu')
@@ -1501,15 +1680,22 @@ def align_images_with_astroalign(session_dir, filter_name, reference_path):
             aligned.write(img_path.with_name(f"{img_path.stem}_aligned{img_path.suffix}"), overwrite=True)
         except Exception as e:
             debug(f"Astroalign alignment failure for {img_path}: {e}")
+            emit("progress", "align_images_with_astroalign_done", params={"success": False, "error": str(e)})
             return False
+
     debug(f"Astroalign alignment completed for {filter_name}")
+    emit("progress", "align_images_with_astroalign_done", params={"success": True, "filter": filter_name})
     return True
+
 
 # --------------------------------------------------------------------------
 # COORDINATION AND MAIN RUNNER
 # --------------------------------------------------------------------------
 def cleanup_session(session_dir: Path):
     """Clean all temporary files, including converted masters and gradient residuals."""
+
+    emit("progress", "cleanup_session_started", params={"session": session_dir.name})
+
     temp_patterns = [
         "*.tmp", "*.log", "*.pid", "*.lock", "*.txt",
         "work_*/",           # Working directories
@@ -1532,6 +1718,7 @@ def cleanup_session(session_dir: Path):
         session_dir / "flats"
     ]
 
+    deleted_count = 0
     for base_dir in base_dirs:
         if not base_dir.is_dir():
             continue
@@ -1541,12 +1728,17 @@ def cleanup_session(session_dir: Path):
                 try:
                     if match.is_file():
                         match.unlink()
+                        deleted_count += 1
                         debug(f"Temporary file deleted: {match}")
                     elif match.is_dir():
                         shutil.rmtree(match)
+                        deleted_count += 1
                         debug(f"Temporary directory deleted: {match}")
                 except Exception as e:
                     debug(f"Failed to delete {match}: {e}")
+
+    emit("progress", "cleanup_session_done", params={"deleted": deleted_count})
+
 
 def run(args) -> bool:
     session_uuid = args.uuid
@@ -1562,6 +1754,7 @@ def run(args) -> bool:
         if f.is_file() and f.suffix.lower() in VALID_EXTENSIONS:
             first_light = f
             break
+
     output_bits = 32
     if first_light:
         output_bits = get_fits_bitdepth(first_light)
@@ -1572,12 +1765,14 @@ def run(args) -> bool:
     file_prefix = f"{dso_name}_{timestamp}"
 
     if not lights_dir.is_dir():
-        emit("error", params={"detail": "Lights directory not found"})
+        emit("error",  "start", params={"detail": "Lights directory not found"})
         return False
+
     cleanup_session(current_session_dir)
 
     # 1. Sort and index files by detected filter
-    emit("progress", data={"step": "start", "message": f"Processing started for {dso_name}"})
+    emit("progress", "start", params={"target": dso_name, "message": f"Processing started for {dso_name}"})
+    emit("progress", "file_analysis", params={"target": dso_name})
     debug(f"Analyzing raws for {dso_name.upper()} | Session: {current_session_dir.name}")
 
     files_by_filter = {}
@@ -1644,7 +1839,7 @@ def run(args) -> bool:
 
     detected_filters = list(files_by_filter.keys())
     if not detected_filters:
-        emit("error", params={"detail": "No valid FITS files found"})
+        emit("error", "start", params={"detail": "No valid FITS files found"})
         return False
 
     PRIORITY = {
@@ -1653,7 +1848,14 @@ def run(args) -> bool:
         'LUMINANCE': 6, 'CLEAR': 7
     }
     detected_filters = sorted(detected_filters, key=lambda f: PRIORITY.get(f, 99))
-    emit("progress", data={"step": "filters_detected", "filters": detected_filters})
+    emit("progress", "filters_detected", params={"filters": detected_filters})
+
+    total_files = sum(len(v) for v in files_by_filter.values())
+    emit("progress", "filters_detected", params={
+        "filters":     detected_filters,
+        "count":       len(detected_filters),
+        "total_files": total_files,
+    })
 
     # 2. Sensor type diagnostic on the first available raw
     first_filter_key = detected_filters[0]
@@ -1665,19 +1867,17 @@ def run(args) -> bool:
 
     # 3. Individual processing and stacking of channels in Siril
     for current_filter in detected_filters:
-        emit("progress", data={"step": "stacking_started", "filter": current_filter})
+        emit("progress", "stacking_started", params={"filter": current_filter})
 
         master_dark_path = get_master_dark_path(current_session_dir, current_filter)
         master_flat_path = get_master_flat_path(current_session_dir, current_filter)
         master_bias_path = get_master_bias_path(current_session_dir, current_filter)
 
-        emit("progress", data={
-            "step": "calibration_status",
-            "masters": {
-                "dark": bool(master_dark_path),
-                "flat": bool(master_flat_path),
-                "bias": bool(master_bias_path)
-             }
+        emit("progress", "calibration_masters", params={
+            "filter":  current_filter,
+            "dark":    bool(master_dark_path),
+            "flat":    bool(master_flat_path),
+            "bias":    bool(master_bias_path),
         })
 
         first_file_for_filter = sorted(files_by_filter[current_filter])[0]
@@ -1690,10 +1890,11 @@ def run(args) -> bool:
             effective_filter = "CLEAR"
             debug(f"Reclassified {current_filter} → CLEAR (OSC camera, unfiltered)")
 
-        emit("progress", data={
-            "step": "sensor_type",
-            "filter": current_filter,
-            "type": "color" if filter_is_color else "mono"
+        emit("progress", "sensor_type", params={
+                       
+            "filter":           current_filter,
+            "effective_filter": effective_filter,
+            "type":             "color" if filter_is_color else "mono",
         })
 
 
@@ -1716,6 +1917,7 @@ def run(args) -> bool:
             num_files += 1
 
         # Generate and execute stacking script
+        emit("progress", "siril_script_started", params={"filter": current_filter, "frames": num_files})
         stack_script = generate_siril_stack_script(
             filter_work_dir,
             effective_filter,
@@ -1735,6 +1937,8 @@ def run(args) -> bool:
             work_dir=filter_work_dir
         )
 
+        emit("progress", "siril_script_done", params={"filter": current_filter, "success": success})
+
         fits_count = len(list(filter_work_dir.glob("*.fit")))
         seq_count  = len(list(filter_work_dir.glob("*.seq")))
         debug(f"=== work_{current_filter}: {fits_count} FITS, {seq_count} SEQ ===")
@@ -1748,12 +1952,13 @@ def run(args) -> bool:
             success = False
 
         if not success:
-            emit("error", data={"step": "stacking_failed", "filter": current_filter})
+            emit("error", "stacking_failed", params={"filter": current_filter})
             if filter_work_dir.is_dir():
                 shutil.rmtree(filter_work_dir)
             continue
 
-        emit("progress", data={"step": "stacking_done", "filter": current_filter})
+        emit("progress", "stacking_done", params={"filter": current_filter})
+
         siril_default_fit = current_session_dir / f"stacked_{effective_filter}.fit"
         custom_fit_name   = current_session_dir / f"{file_prefix}_{current_filter}.fit"
 
@@ -1770,7 +1975,11 @@ def run(args) -> bool:
 
     # 4. Crucial step: Global cross-filter alignment
     if len(master_files_map) > 1:
-        emit("progress", data={"step": "inter_filter_alignment_started", "message": "Global geometric alignment..."})
+        emit("progress", "inter_filter_alignment_started", params={
+              
+            "total":   len(master_files_map),
+            "message": "Global geometric alignment...",
+        })
         ref_candidate = master_files_map.get('HA') or list(master_files_map.values())[0]
 
         # Define list of files to align
@@ -1782,10 +1991,11 @@ def run(args) -> bool:
                 if aligned.exists():
                     master_files_map[filter_k] = aligned
         else:
-            emit("warning", data={"step": "inter_filter_alignment_failed", "message": "Failed, using raws"})
+            emit("warning", "inter_filter_alignment_failed", params={"message": "Failed, using raws"})
 
      # 5. Final extraction of FITS containers to linear TIFF images for each validated channel
     for current_filter, final_fit_path in master_files_map.items():
+        emit("progress", "tiff_extraction_started", params={"filter": current_filter})
         debug(f"Finalized linear master TIFF extraction : {current_filter}")
         # Temporarily go through the final tree to generate conversion .ssf
         conv_script = generate_siril_script(
@@ -1795,6 +2005,7 @@ def run(args) -> bool:
             fit_path=final_fit_path
         )
         run_siril_command(current_session_dir, conv_script, f"conv_{current_filter}.ssf")
+        emit("progress", "tiff_extraction_done", params={"filter": current_filter})
 
     # 6. Mapping of generated TIFF files
     tif_mapped_files = {}
@@ -1805,13 +2016,15 @@ def run(args) -> bool:
 
     if not tif_mapped_files:
         debug("Critical failure collecting intermediate TIFF matrices.")
-        emit("done", data={"uuid": session_uuid, "output_format": format_requested})
+        emit("error", "tiff_mapping_failed", params={"detail": "No TIFF files found after extraction"})
+        emit("done", params={"uuid": session_uuid, "output_format": format_requested})
         return False
 
     # 7. Final composition via ImageMagick
-    emit("progress", data={"step": "composition_started", "format": format_requested})
+    emit("progress", "composition_started", params={"format": format_requested, "channels": list(tif_mapped_files.keys())})
     composite_success = compose_rgb_image(current_session_dir, tif_mapped_files, format_requested, file_prefix)
-    
+
+    emit("progress", "cleanup")
     try:
         cleanup_session(current_session_dir)
     except Exception as e:
@@ -1820,33 +2033,37 @@ def run(args) -> bool:
     if composite_success:
         final_image = current_session_dir / f"{file_prefix}_full.{format_requested}"
         if final_image.is_file():
+            emit("progress", "orientation_correction", params={"file": final_image.name})
             last_stacked = next(iter(master_files_map.values()), None)
             correct_image_orientation(final_image, fits_source_path=last_stacked)
-            emit("done", data={
-                "uuid": session_uuid,
+
+            emit("done", "composition_done", params={
+                "uuid":          session_uuid,
                 "output_format": format_requested,
-                "file_prefix": file_prefix,
-                "final_file": final_image.name
+                "file_prefix":   file_prefix,
+                "final_file":    final_image.name
             })
 
             for tiff_path in tif_mapped_files.values():
-                if tiff_path.is_file(): 
+                if tiff_path.is_file():
                     tiff_path.unlink()
     else:
-        emit("error", data={"step": "composition_failed", "detail": "Final composition failed"})
+        emit("error", "composition_failed", params={"detail": "Final composition failed"})
 
     return True
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stacking pipeline")
-    parser.add_argument("uuid", help="Unique session UUID/directory")
-    parser.add_argument("--format", default="png", choices=["png", "jpg", "tiff", "webp"], help="Final file encoding format")
-    parser.add_argument("--dso", default="unknown", help="Target celestial object name (e.g., ngc2359, m42)")
+    parser.add_argument("uuid",      help="Unique session UUID/directory")
+    parser.add_argument("--format",  default="png",     choices=["png", "jpg", "tiff", "webp"], help="Final file encoding format")
+    parser.add_argument("--dso",     default="unknown",  help="Target celestial object name (e.g., ngc2359, m42)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Display debug log")
 
-    args = parser.parse_args()
-    VERBOSE = args.verbose
+    args     = parser.parse_args()
+    VERBOSE  = args.verbose
     DSO_NAME = args.dso
+
     try:
         success = run(args)
         if not success:
