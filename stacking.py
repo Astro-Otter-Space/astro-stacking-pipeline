@@ -45,8 +45,20 @@ BROADBAND_FILTERS = {'RED', 'GREEN', 'BLUE', 'CLEAR', 'LUMINANCE', 'L', 'R', 'G'
 VERBOSE = False
 DSO_NAME = ''
 VALID_EXTENSIONS = {'.fits', '.fit', '.fts', '.nef', '.cr2', '.cr3', '.arw', '.raw', '.dng'}
-DENOISE_FRAME_THRESHOLD = 30
+# Denoise (DA3D) is only ever applied to very short broadband mono stacks,
+# where per-frame noise dominates and the stack itself is too shallow to
+# average it out. Below this many frames → denoise is considered; at or
+# above it, normal stacking noise averaging is trusted instead.
+DENOISE_SHORT_STACK_THRESHOLD = 5
 USE_PCC = False
+# Registration (Siril 'register') rarely produces perfectly-overlapping frames:
+# each sub can be shifted/rotated by a fraction of a pixel to several pixels
+# relative to the reference, so the stacked master has a thin border where not
+# every frame contributed data (visible as a black, noisy, or mis-colored
+# fringe — e.g. a stray hue line along one edge). Cropping a small percentage
+# off each side removes this without perceptibly cutting into the frame.
+# Set to 0.0 to disable.
+BORDER_CROP_PERCENT = 1.5
 SIRIL_VERSION_MAJOR = 1
 SIRIL_VERSION_MINOR = 2 # Set to 4 when upgrading to enable cc -nostellar
 
@@ -508,12 +520,13 @@ def get_color_calibration_command(
 
                 if focal and pixel_size:
                     debug(f"PCC: focal={int(focal)}mm pixel={float(pixel_size)}µm")
-                    emit("progress", "get_color_calibration_command_done", params={"command": cmd, "reason": "pcc_with_metadata"})
-                    return (
+                    cmd = (
                         f"pcc -focal={int(focal)}"
                         f" -pixelsize={float(pixel_size)}"
                         f" -noflip -downscale"
                     )
+                    emit("progress", "get_color_calibration_command_done", params={"command": cmd, "reason": "pcc_with_metadata"})
+                    return cmd
         except Exception as e:
             debug(f"PCC metadata read failed ({e}), skipping color calibration")
 
@@ -637,13 +650,15 @@ def should_apply_denoise(
     3. Multi-filter palette → never (different mod per filter = color cast
        on the final composite)
 
-    Activation rules (all must be true):
-    - Mono camera
-    - Broadband only
-    - At least DENOISE_FRAME_THRESHOLD frames (default: 20)
-    - At least one calibration master available
+    Activation rule:
+    - Mono camera, broadband only, AND fewer than DENOISE_SHORT_STACK_THRESHOLD
+      frames (default: 5). Stacks at or above that count average out per-frame
+      noise naturally through stacking itself — DA3D is unnecessary and risks
+      softening real detail. Below that count, per-frame noise dominates and
+      light denoise helps.
 
-    The mod adapts to the available calibration quality.
+    The mod adapts to the available calibration quality (more DOF masters →
+    lower/gentler mod).
     """
 
     # --- PRIORITY EXCLUSIONS ---
@@ -675,13 +690,13 @@ def should_apply_denoise(
         return False, 0.0
 
     # Broadband mono: ONLY on very short stacks where noise dominates
-    # Normal stacks (>= 5 frames) average noise naturally — DA3D not needed
-    if num_files >= 5:
+    # Normal stacks (>= threshold frames) average noise naturally — DA3D not needed
+    if num_files >= DENOISE_SHORT_STACK_THRESHOLD:
         debug(f"Denoise [{filter_name}]: OFF — broadband, enough frames to average noise")
         emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": False, "reason": "enough_frames"})
         return False, 0.0
 
-    # Very short broadband stack (< 5 frames): light denoise
+    # Very short broadband stack (< threshold): light denoise
     has_dark  = bool(master_dark_path)
     has_flat  = bool(master_flat_path)
     has_bias  = bool(master_bias_path)
@@ -800,6 +815,22 @@ def get_stretch_command(
             return _done(["autostretch -linked -2.8 0.25"])
 
     if is_broadband:
+        return _done(["autostretch -linked -2.8 0.25"])
+
+    # ------------------------------------------------------------------
+    # UNRECOGNIZED FILTER SAFEGUARD (e.g. UHC, CLS, DUAL_NARROWBAND,
+    # SOLAR, IR_CUT — anything in VALID_FILTERS but absent from both
+    # NARROWBAND_FILTERS and BROADBAND_FILTERS).
+    # Every other function in the pipeline (should_apply_denoise,
+    # rejection/weighting in generate_siril_stack_script) only special-cases
+    # NARROWBAND_FILTERS and treats everything else as broadband-like.
+    # Falling through to the narrowband branch below for these filters would
+    # apply a darker targetbg than the rest of the pipeline assumes,
+    # producing an inconsistently crushed stretch. Mirror that convention
+    # here instead of silently reusing the narrowband defaults.
+    # ------------------------------------------------------------------
+    if not is_narrowband:
+        debug(f"Stretch: unrecognized filter '{filter_name}', using broadband defaults")
         return _done(["autostretch -linked -2.8 0.25"])
 
     # ------------------------------------------------------------------
@@ -1114,6 +1145,45 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
 # --------------------------------------------------------------------------
 # CHROMINANCE & COMPOSITION VIA IMAGEMAGICK
 # --------------------------------------------------------------------------
+def crop_registration_border(image_path: Path, percent: float) -> bool:
+    """
+    Shave a percentage of the border off each side of the final composed
+    image to remove registration artifacts: thin fringes of black, noisy,
+    or mis-colored pixels along one or more edges where not every aligned
+    frame contributed data (visible e.g. as a stray-hued line along the
+    top edge on multi-channel composites).
+
+    Percentage is computed independently per axis from the image's own
+    dimensions so it scales correctly regardless of output resolution.
+    No-op if percent <= 0.
+    """
+    if percent <= 0:
+        return True
+
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+    except Exception as e:
+        debug(f"Border crop: could not read dimensions of {image_path.name} ({e}), skipping")
+        return False
+
+    shave_x = max(1, round(width * percent / 100))
+    shave_y = max(1, round(height * percent / 100))
+
+    cmd = ["convert", str(image_path), "-shave", f"{shave_x}x{shave_y}", str(image_path)]
+    try:
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        debug(f"Border crop: shaved {shave_x}x{shave_y}px ({percent}%) from {image_path.name}")
+        emit("progress", "crop_registration_border_done", params={
+            "file": image_path.name, "percent": percent, "shave_x": shave_x, "shave_y": shave_y
+        })
+        return True
+    except subprocess.CalledProcessError as e:
+        debug(f"Border crop failed on {image_path.name}: {e.stderr}")
+        emit("progress", "crop_registration_border_done", params={"file": image_path.name, "success": False, "error": str(e)})
+        return False
+
+
 def compose_rgb_image(
     session_dir: Path,
     tif_files: dict,
@@ -1165,11 +1235,35 @@ def compose_rgb_image(
     # Resolve the actual key used for the broadband mono channel
     clear_key     = next((k for k in ("CLEAR", "L", "LUMINANCE") if k in tif_files), None)
 
+    _synthetic_black_path = {"path": None}
+
     def chan(key: str) -> str:
-        """Return the channel TIFF path, or a synthetic black image of the correct size."""
+        """
+        Return the channel TIFF path, or a synthetic black image of the correct size.
+
+        NOTE: 'xc:black[WxH]' is NOT valid ImageMagick syntax for canvas creation —
+        the [WxH] suffix is a read-region modifier applied to existing raster images,
+        it has no effect on the 'xc:' pseudo-format (which defaults to 1x1 px). Using
+        it here silently produced a wrongly-sized (or erroring) synthetic channel
+        whenever a channel was missing (e.g. partial RGB). We generate a real black
+        TIFF on disk instead, sized to match the reference channel exactly.
+        """
         if key in tif_files:
             return str(tif_files[key])
-        return f"xc:black[{width}x{height}]"
+
+        if _synthetic_black_path["path"] is None:
+            black_path = session_dir / f".synthetic_black_{width}x{height}.tif"
+            try:
+                subprocess.run(
+                    ["convert", "-size", f"{width}x{height}", "xc:black", str(black_path)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+                )
+                _synthetic_black_path["path"] = str(black_path)
+                debug(f"Synthetic black channel generated: {black_path.name} ({width}x{height})")
+            except subprocess.CalledProcessError as e:
+                debug(f"Failed to generate synthetic black channel, falling back to xc:black: {e}")
+                _synthetic_black_path["path"] = "xc:black"  # last-resort: correct color, wrong size
+        return _synthetic_black_path["path"]
 
     def blend_cmd(img_a: str, img_b: str, pct_a: int) -> list:
         """
@@ -1187,16 +1281,23 @@ def compose_rgb_image(
 
     # ------------------------------------------------------------------
     # MONO PASSTHROUGH — single channel, not broadband
-    # No combination needed; export directly without post-processing.
+    # Applies the same finishing chain as the CLEAR palette (level clip,
+    # sigmoidal contrast, light sharpening) so a single-filter session
+    # (e.g. HA only) doesn't ship a flat, unprocessed export while every
+    # other palette gets full post-processing.
     # CLEAR/L/LUMINANCE are handled below as a named palette instead.
     # ------------------------------------------------------------------
     if len(tif_files) == 1 and not has_clear:
         single_channel = list(tif_files.values())[0]
-        cmd = ["convert", str(single_channel)]
+        cmd = [
+            "convert", str(single_channel),
+            "-level", "1%,99%",
+            "-sigmoidal-contrast", "3x48%",
+            "-unsharp", "0x1.0+0.5+0.02",
+        ]
         if output_format in ["webp", "jpg"]:
             cmd.extend(["-quality", "95"])
         cmd.append(str(output_file))
-        emit("progress", "compose_rgb_image_done", params={"palette": "MONO", "success": True})
         try:
             result = subprocess.run(
                 cmd,
@@ -1204,7 +1305,13 @@ def compose_rgb_image(
                 stderr=subprocess.PIPE,
                 text=True
             )
-            return result.returncode == 0
+            success = result.returncode == 0
+            if not success:
+                debug(f"ImageMagick STDERR (MONO): {result.stderr}")
+            if success:
+                crop_registration_border(output_file, BORDER_CROP_PERCENT)
+            emit("progress", "compose_rgb_image_done", params={"palette": "MONO", "success": success})
+            return success
         except Exception as e:
             debug(f"ImageMagick Single Channel Failure: {e}")
             emit("progress", "compose_rgb_image_done", params={"palette": "MONO", "success": False, "error": str(e)})
@@ -1469,6 +1576,8 @@ def compose_rgb_image(
             debug(f"ImageMagick STDERR: {result.stderr}")
         success = result.returncode == 0
         emit("progress", "imagemagick_done", params={"palette": palette_label, "success": success})
+        if success:
+            crop_registration_border(output_file, BORDER_CROP_PERCENT)
         emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": success})
         return success
     except Exception as e:
@@ -1476,6 +1585,12 @@ def compose_rgb_image(
         emit("progress", "imagemagick_done", params={      "palette": palette_label, "success": False, "error": str(e)})
         emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": False, "error": str(e)})
         return False
+    finally:
+        if _synthetic_black_path["path"] and _synthetic_black_path["path"] != "xc:black":
+            try:
+                Path(_synthetic_black_path["path"]).unlink(missing_ok=True)
+            except Exception as e:
+                debug(f"Failed to remove synthetic black channel file: {e}")
 
 
 def get_image_dimensions(ref_path: Path) -> tuple:
@@ -1493,30 +1608,22 @@ def correct_image_orientation(image_path: Path, fits_source_path: Path = None) -
     """
     Flip the image vertically to correct FITS bottom-up storage convention.
 
-    FITS standard stores image rows starting from the bottom (ROWORDER=BOTTOM-UP).
-    Siril preserves this in its stacked output. The flip is needed to display
-    the image in the conventional screen orientation (top-left origin).
+    FITS standard stores image rows starting from the bottom. Siril always
+    reads/displays/processes images in bottom-up order internally, REGARDLESS
+    of any ROWORDER header on the source file — per Siril's own docs, ROWORDER
+    only tells Siril which Bayer demosaic pattern to use on OSC data, it does
+    NOT change how Siril orients the image for display or for its own FITS
+    output. So for a Siril-driven pipeline, checking ROWORDER to decide
+    whether to flip is meaningless: the flip is always needed to go from
+    Siril's bottom-up convention to the conventional top-left screen origin.
 
-    If a source FITS is provided and its ROWORDER header says TOP-DOWN,
-    the flip is skipped — the image is already in the correct orientation.
-    Default behavior (no FITS available or no ROWORDER header): always flip.
+    (A previous version of this function conditionally skipped the flip based
+    on ROWORDER, assuming it was a display-orientation hint like it is in some
+    other tools — e.g. SharpCap/INDI writers. That assumption doesn't hold for
+    Siril and produced upside-down composites. Do not reintroduce that check
+    without first confirming Siril's ROWORDER semantics have changed.)
     """
     emit("progress", "correct_image_orientation_started", params={"file": image_path.name})
-
-    needs_flip = True
-
-    if fits_source_path and fits_source_path.exists():
-        try:
-            with fits.open(fits_source_path, mode='readonly',
-                           ignore_missing_end=True) as hdul:
-                roworder = hdul[0].header.get('ROWORDER', 'BOTTOM-UP').upper()
-                needs_flip = 'BOTTOM' in roworder
-                debug(f"Orientation: ROWORDER={roworder} → flip={needs_flip}")
-        except Exception as e:
-            debug(f"Orientation: could not read ROWORDER ({e}), defaulting to flip")
-
-#     if not needs_flip:
-#         return
 
     cmd = ["convert", str(image_path), "-flip", str(image_path)]
     try:
