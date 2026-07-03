@@ -24,7 +24,7 @@ import re
 import traceback
 import json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from astropy.io import fits
 from PIL import Image
 import numpy as np
@@ -59,6 +59,24 @@ USE_PCC = False
 # off each side removes this without perceptibly cutting into the frame.
 # Set to 0.0 to disable.
 BORDER_CROP_PERCENT = 1.5
+
+# --- Star halo reduction ---
+# Bright, oversaturated stars (e.g. 52 Cygni next to NGC 6960) can bloom
+# large enough to eat into nearby faint nebula signal. No StarNet++
+# dependency assumed to be available on this machine, so this uses a
+# mask+erode technique instead of full star removal/synthesis:
+# a bright-pixel mask isolates stars, a min-filtered (eroded) copy of the
+# image is blended back in ONLY within that mask — small round bright
+# blobs (stars) shrink noticeably under a min filter, large diffuse
+# structures (nebula) barely change.
+# UNVERIFIED ON REAL DATA — this is a first pass. Tune or disable via the
+# constants below after checking a real render; see reduce_star_halos()
+# docstring for what each one controls.
+ENABLE_STAR_HALO_REDUCTION = True
+STAR_HALO_MASK_THRESHOLD = 88   # percent; only pixels brighter than this (of the image's own luma) are treated as "star" — higher = fewer/brighter-only stars affected
+STAR_HALO_MASK_FEATHER    = 3   # px blur radius on the mask edge, avoids a visible ring around each treated star
+STAR_HALO_ERODE_RADIUS    = 2   # px; size of the min-filter kernel — larger = more shrinkage but more risk of clipping small stars to nothing
+STAR_HALO_BLEND_PERCENT   = 45  # 0-100; how much of the eroded copy to mix back in within the mask — lower = gentler
 
 # --- Background depth (autostretch targetbg) tuning ---
 # Lower targetbg = darker sky background = more contrast on faint structure,
@@ -103,7 +121,9 @@ def debug(message: str):
 
 def emit(status: str, step: str, params: dict = None):
     """Emit a JSON message to stderr for IPC with Symfony API."""
-    payload = {"status": status, "step": step}
+    time = datetime.now().strftime('%H:%M:%S')
+    payload = {"status": status, "step": step, "time": time}
+
     if params: payload["params"] = params
     print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
 
@@ -948,10 +968,21 @@ def generate_siril_stack_script(
     master_bias_path: str = None,
     output_bits: int = 32,
     light_files: list = None,
+    stretch_reference_files: int = None,
 ) -> str:
     """
     Generates the .ssf script for Siril.
     num_files: used to validate that we have at least 2 images for the stack
+
+    stretch_reference_files: if provided, used INSTEAD of num_files only for
+    the targetbg quality bucket (get_stretch_command) — not for rejection,
+    weighting, or denoise, which must reflect this filter's actual frame
+    count. Pass the minimum frame count across sibling channels that must
+    end up with identical stretch parameters (RGB: RED/GREEN/BLUE: narrowband:
+    HA/OIII/SII/H_BETA) so a session where channels straddle a quality
+    threshold (e.g. R=21, B=19 frames around STACK_GOOD_MIN_FRAMES=20)
+    doesn't get a different targetbg per channel and a visible tint mismatch
+    in the composite. Defaults to num_files when not provided.
     """
 
     emit("progress", "generate_siril_stack_script_started", params={
@@ -1015,9 +1046,26 @@ def generate_siril_stack_script(
     #              with so few data points and risk leaving 0 usable frames.
     #              Simple mean (no rej keyword) is the only safe option.
     # 4–5 frames : Sigma with wide bounds (4σ) — light outlier rejection only
-    # 6–49 frames: Winsorized — robust balance for typical EAA stacks
-    # ≥ 100 frames: Linear Fit Clipping — best for large, varied-quality stacks
+    # 6–100 frames: Winsorized — robust balance for typical EAA stacks
+    # >100 frames: Linear Fit Clipping — best for large, varied-quality stacks
+    #
+    # sigma_high tightened (3.0->2.0 winsorized, 3.0->2.2 linear) after
+    # confirming on real data (M20 LRGB: L=100 frames hit winsorized, R/G/B
+    # at 118-126 frames hit linear) that a satellite trail survived rejection
+    # under BOTH algorithms at the old bounds — this isn't a "wrong algorithm
+    # for this frame count" problem, both let a bright transient through.
+    # sigma_low is left wider: trails are bright outliers (need a tighter
+    # HIGH bound to catch), tightening low too would mainly cost extra
+    # rejection of dark noise/vignetting without helping against trails.
+    # Unverified against a next real run — tune SIGMA_HIGH_WINSORIZED /
+    # SIGMA_HIGH_LINEAR further if a trail still survives, or loosen if
+    # legitimate faint signal starts getting clipped.
     # -------------------------------------------------------------------------
+    SIGMA_LOW_WINSORIZED  = 3.0
+    SIGMA_HIGH_WINSORIZED = 2.0   # was 3.0
+    SIGMA_LOW_LINEAR      = 4.0
+    SIGMA_HIGH_LINEAR     = 2.2   # was 3.0
+
     if num_files <= 3:
         rejection     = None      # no rejection at all
         sigmas        = None
@@ -1026,10 +1074,10 @@ def generate_siril_stack_script(
         sigmas        = "4 4"     # wide bounds — avoid over-clipping small stacks
     elif num_files <= 100:
         rejection     = "winsorized"
-        sigmas        = "3 3"
+        sigmas        = f"{SIGMA_LOW_WINSORIZED} {SIGMA_HIGH_WINSORIZED}"
     else:
         rejection     = "linear"
-        sigmas        = "4 3"
+        sigmas        = f"{SIGMA_LOW_LINEAR} {SIGMA_HIGH_LINEAR}"
 
     # -------------------------------------------------------------------------
     # WEIGHTING
@@ -1110,8 +1158,12 @@ def generate_siril_stack_script(
     )
 
     # 5. Autostretch
+    # Uses stretch_reference_files (group-min across sibling channels) when
+    # provided, so RGB/narrowband channels from the same session land in the
+    # same good/medium/short bucket together — see docstring above.
     stretch_cmds = get_stretch_command(
-        filter_name, is_color, num_files,
+        filter_name, is_color,
+        stretch_reference_files if stretch_reference_files is not None else num_files,
         any([master_dark_path, master_flat_path, master_bias_path])
     )
 
@@ -1269,6 +1321,91 @@ def crop_registration_border(image_path: Path, percent: float) -> bool:
         return False
 
 
+def reduce_star_halos(image_path: Path) -> bool:
+    """
+    Shrink bloated bright-star halos on the final composed image, without a
+    full star-removal/synthesis pipeline (no StarNet++ dependency, which may
+    not be installed on this machine).
+
+    Technique (pure ImageMagick, three real temp files — no fragile one-liner):
+      1. mask   = bright-pixel mask from the image's own luma, thresholded at
+                  STAR_HALO_MASK_THRESHOLD%, edges feathered with a blur so
+                  the treated region doesn't end in a hard ring.
+      2. eroded = a copy run through a min-filter (-statistic Minimum) of
+                  size STAR_HALO_ERODE_RADIUS — small round bright blobs
+                  (stars) shrink noticeably; large diffuse structures
+                  (nebula) barely move, since the filter only pulls each
+                  pixel down to the darkest value in its small neighborhood.
+      3. blend  = weighted mix of original and eroded (STAR_HALO_BLEND_PERCENT),
+                  then composited back over the original using the mask as
+                  alpha — so only the bright/star regions actually change.
+
+    UNVERIFIED ON REAL DATA. If stars look artificially chopped/square,
+    lower STAR_HALO_ERODE_RADIUS or STAR_HALO_BLEND_PERCENT first (in that
+    order) rather than raising STAR_HALO_MASK_THRESHOLD — a too-high
+    threshold just makes the effect patchy, it doesn't make it gentler.
+    """
+    if not ENABLE_STAR_HALO_REDUCTION:
+        return True
+
+    stem = image_path.stem
+    mask_path   = image_path.parent / f".star_mask_{stem}.tif"
+    eroded_path = image_path.parent / f".star_eroded_{stem}.tif"
+    blend_path  = image_path.parent / f".star_blend_{stem}.tif"
+    masked_path = image_path.parent / f".star_masked_{stem}.tif"
+
+    try:
+        # 1. Feathered bright-pixel mask
+        subprocess.run([
+            "convert", str(image_path),
+            "-colorspace", "Gray",
+            "-level", f"{STAR_HALO_MASK_THRESHOLD}%,100%",
+            "-blur", f"0x{STAR_HALO_MASK_FEATHER}",
+            str(mask_path)
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # 2. Eroded (min-filtered) copy
+        kernel = STAR_HALO_ERODE_RADIUS * 2 + 1
+        subprocess.run([
+            "convert", str(image_path),
+            "-statistic", "Minimum", f"{kernel}x{kernel}",
+            str(eroded_path)
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # 3a. Blend original + eroded at the configured strength
+        subprocess.run([
+            "convert", str(image_path), str(eroded_path),
+            "-compose", "Blend", "-define", f"compose:args={STAR_HALO_BLEND_PERCENT}",
+            "-composite", str(blend_path)
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # 3b. Restrict that blend to the star mask (mask becomes its alpha)
+        subprocess.run([
+            "convert", str(blend_path), str(mask_path),
+            "-alpha", "off", "-compose", "CopyOpacity", "-composite",
+            str(masked_path)
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # 3c. Composite the masked blend back over the original
+        subprocess.run([
+            "convert", str(image_path), str(masked_path),
+            "-compose", "Over", "-composite", str(image_path)
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        emit("progress", "reduce_star_halos_done", params={"file": image_path.name, "success": True})
+        return True
+    except subprocess.CalledProcessError as e:
+        debug(f"Star halo reduction failed on {image_path.name}: {e.stderr}")
+        emit("progress", "reduce_star_halos_done", params={"file": image_path.name, "success": False, "error": str(e)})
+        return False
+    finally:
+        for p in (mask_path, eroded_path, blend_path, masked_path):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception as e:
+                debug(f"Failed to remove star-halo temp file {p.name}: {e}")
+
+
 def compose_rgb_image(
     session_dir: Path,
     tif_files: dict,
@@ -1395,6 +1532,7 @@ def compose_rgb_image(
                 debug(f"ImageMagick STDERR (MONO): {result.stderr}")
             if success:
                 crop_registration_border(output_file, BORDER_CROP_PERCENT)
+                reduce_star_halos(output_file)
             emit("progress", "compose_rgb_image_done", params={"palette": "MONO", "success": success})
             return success
         except Exception as e:
@@ -1663,6 +1801,7 @@ def compose_rgb_image(
         emit("progress", "imagemagick_done", params={"palette": palette_label, "success": success})
         if success:
             crop_registration_border(output_file, BORDER_CROP_PERCENT)
+            reduce_star_halos(output_file)
         emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": success})
         return success
     except Exception as e:
@@ -1933,6 +2072,7 @@ def cleanup_session(session_dir: Path):
 
 
 def run(args) -> bool:
+    start = datetime.now()
     session_uuid = args.uuid
     local_sessions_root = BASE_DIR / "sessions"
     current_session_dir = local_sessions_root / session_uuid
@@ -2042,6 +2182,21 @@ def run(args) -> bool:
     detected_filters = sorted(detected_filters, key=lambda f: PRIORITY.get(f, 99))
     emit("progress", "filters_detected", params={"filters": detected_filters})
 
+    # Cross-channel stretch consistency: RGB channels (and, separately,
+    # narrowband channels) must share the same targetbg bucket or the
+    # composite can show a slight tint mismatch between channels that
+    # straddle a quality threshold (e.g. R=21 frames "good", B=19 "medium").
+    # Compute the group minimum once here and pass it through to
+    # generate_siril_stack_script as stretch_reference_files.
+    _rgb_group_filters = [f for f in detected_filters if f in {"RED", "GREEN", "BLUE"}]
+    _nb_group_filters  = [f for f in detected_filters if f in NARROWBAND_FILTERS]
+    rgb_group_min_files = min((len(files_by_filter[f]) for f in _rgb_group_filters), default=None)
+    nb_group_min_files  = min((len(files_by_filter[f]) for f in _nb_group_filters), default=None)
+    if _rgb_group_filters:
+        debug(f"RGB group stretch reference: {rgb_group_min_files} frames (min of {[len(files_by_filter[f]) for f in _rgb_group_filters]})")
+    if _nb_group_filters:
+        debug(f"Narrowband group stretch reference: {nb_group_min_files} frames (min of {[len(files_by_filter[f]) for f in _nb_group_filters]})")
+
     total_files = sum(len(v) for v in files_by_filter.values())
     emit("progress", "filters_detected", params={
         "filters":     detected_filters,
@@ -2110,6 +2265,17 @@ def run(args) -> bool:
 
         # Generate and execute stacking script
         emit("progress", "siril_script_started", params={"filter": current_filter, "frames": num_files})
+        # Determine cross-channel stretch reference: RGB and narrowband
+        # channels use their group minimum (computed above) so siblings land
+        # in the same targetbg bucket; anything else (L/CLEAR/single-filter
+        # narrowband) just uses its own frame count.
+        if effective_filter in {"RED", "GREEN", "BLUE"} and rgb_group_min_files is not None:
+            stretch_reference_files = rgb_group_min_files
+        elif effective_filter in NARROWBAND_FILTERS and nb_group_min_files is not None:
+            stretch_reference_files = nb_group_min_files
+        else:
+            stretch_reference_files = num_files
+
         stack_script = generate_siril_stack_script(
             filter_work_dir,
             effective_filter,
@@ -2121,6 +2287,7 @@ def run(args) -> bool:
             master_bias_path,
             output_bits=output_bits,
             light_files=sorted(files_by_filter[current_filter]),
+            stretch_reference_files=stretch_reference_files,
         )
         success = run_siril_command(
             current_session_dir,
@@ -2229,11 +2396,15 @@ def run(args) -> bool:
             last_stacked = next(iter(master_files_map.values()), None)
             correct_image_orientation(final_image, fits_source_path=last_stacked)
 
+            end = datetime.now()
+            elapsed = end - start
             emit("done", "composition_done", params={
                 "uuid":          session_uuid,
                 "output_format": format_requested,
                 "file_prefix":   file_prefix,
-                "final_file":    final_image.name
+                "final_file":    final_image.name,
+                "elapsed_time":  str(elapsed), # Format "H:MM:SS.ms"
+                "total_seconds": elapsed.total_seconds(),
             })
 
             for tiff_path in tif_mapped_files.values():
