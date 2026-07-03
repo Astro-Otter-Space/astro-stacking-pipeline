@@ -59,6 +59,40 @@ USE_PCC = False
 # off each side removes this without perceptibly cutting into the frame.
 # Set to 0.0 to disable.
 BORDER_CROP_PERCENT = 1.5
+
+# --- Background depth (autostretch targetbg) tuning ---
+# Lower targetbg = darker sky background = more contrast on faint structure,
+# at the risk of clipping the faintest signal if the stack's SNR doesn't
+# support it. Centralized here (used throughout get_stretch_command) so they
+# can be tuned in one place instead of hunting through the function.
+# Starting values below are nudged darker than the previous hardcoded ones
+# (NB good 0.15→0.12, medium 0.20→0.17, short 0.28→0.26) — re-tune against a
+# real test render, these are a starting point, not a measured optimum.
+STACK_GOOD_MIN_FRAMES   = 20   # frames (+ masters) required to trust a dark background
+STACK_MEDIUM_MIN_FRAMES = 8    # frames (+ masters) required for a moderate background
+TARGETBG_NB_GOOD    = 0.12     # narrowband, well-calibrated deep stack
+TARGETBG_NB_MEDIUM  = 0.17     # narrowband, medium stack
+TARGETBG_NB_SHORT    = 0.26     # narrowband, short stack / no calibration masters
+TARGETBG_RGB_GOOD   = 0.18     # mono RGB channel, well-calibrated deep stack (was flat 0.25)
+TARGETBG_RGB_MEDIUM = 0.22     # mono RGB channel, medium stack
+TARGETBG_RGB_SHORT  = 0.25     # mono RGB channel, short stack / no calibration masters (old default)
+TARGETBG_MONO_BB_GOOD   = 0.20     # mono broadband (L/LUMINANCE/CLEAR), well-calibrated deep stack
+TARGETBG_MONO_BB_MEDIUM = 0.22     # mono broadband, medium stack
+TARGETBG_MONO_BB_SHORT  = 0.25     # mono broadband, short stack / no calibration masters
+TARGETBG_OSC_BB_GOOD    = 0.17     # OSC broadband (CLEAR/no filter/UHC/CLS), well-calibrated deep stack (was 0.20)
+TARGETBG_OSC_BB_MEDIUM  = 0.20     # OSC broadband, medium stack (was 0.23)
+TARGETBG_OSC_BB_SHORT   = 0.25     # OSC broadband, short stack / no calibration masters (was 0.28)
+
+# --- Narrowband denoise (background noise) ---
+# Previously narrowband was categorically excluded from denoise to protect
+# faint filaments. DA3D at LOW mod is signal-preserving enough to knock down
+# background shot noise without smearing filament structure — the risk was
+# specifically from using broadband-strength mod (0.7-0.85) on narrowband.
+# Keep this ceiling well below the broadband mod range; if filaments start
+# looking soft/waxy on a real render, lower NARROWBAND_DENOISE_MOD further or
+# set ENABLE_NARROWBAND_DENOISE = False to fully revert to the old behavior.
+ENABLE_NARROWBAND_DENOISE = True
+NARROWBAND_DENOISE_MOD = 0.2
 SIRIL_VERSION_MAJOR = 1
 SIRIL_VERSION_MINOR = 2 # Set to 4 when upgrading to enable cc -nostellar
 
@@ -644,21 +678,18 @@ def should_apply_denoise(
 
     Exclusion rules (priority order):
     1. Color OSC camera → never (inter-channel imbalance guaranteed)
-    2. ANY narrowband filter → never (faint filaments and extensions are
-       indistinguishable from noise at low SNR; DA3D will smooth them out
-       before stretch, causing irreversible signal loss)
-    3. Multi-filter palette → never (different mod per filter = color cast
-       on the final composite)
+    2. Broadband multi-filter palette (e.g. RGB) → never — each channel can
+       have a different frame count, so the broadband activation rule below
+       would pick a different mod per channel, risking a color cast.
+    3. Broadband, single filter → only on very short stacks (frame-count
+       dependent mod, see below).
 
-    Activation rule:
-    - Mono camera, broadband only, AND fewer than DENOISE_SHORT_STACK_THRESHOLD
-      frames (default: 5). Stacks at or above that count average out per-frame
-      noise naturally through stacking itself — DA3D is unnecessary and risks
-      softening real detail. Below that count, per-frame noise dominates and
-      light denoise helps.
-
-    The mod adapts to the available calibration quality (more DOF masters →
-    lower/gentler mod).
+    Narrowband gets a fixed, gentle mod (NARROWBAND_DENOISE_MOD) whenever
+    ENABLE_NARROWBAND_DENOISE is set, regardless of how many narrowband
+    filters are active in the session — since the mod is a fixed constant
+    (not derived from frame count), every narrowband channel gets exactly
+    the same treatment, so the "different mod per filter" color-cast risk
+    that excludes broadband multi-filter palettes doesn't apply here.
     """
 
     # --- PRIORITY EXCLUSIONS ---
@@ -675,17 +706,29 @@ def should_apply_denoise(
         emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": False, "reason": "color_osc"})
         return False, 0.0
 
-    # Narrowband: never — faint filaments would be smoothed out
+    # Narrowband (single or multi-filter): gentle, fixed-mod denoise instead
+    # of a blanket exclusion. DA3D at broadband-strength mod (0.7-0.85) would
+    # smooth out faint filaments, but at a low, fixed mod it mainly knocks
+    # down background shot noise. Fixed mod means every narrowband filter in
+    # the session gets identical treatment — no differential-mod color cast.
+    # Toggle off via ENABLE_NARROWBAND_DENOISE if filaments start looking
+    # soft on a real render.
     is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
     if is_narrowband:
-        debug(f"Denoise [{filter_name}]: OFF — narrowband (faint structure risk)")
-        emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": False, "reason": "narrowband"})
+        if ENABLE_NARROWBAND_DENOISE:
+            debug(f"Denoise [{filter_name}]: ON — narrowband, gentle mod={NARROWBAND_DENOISE_MOD}")
+            emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": True, "mod": NARROWBAND_DENOISE_MOD, "reason": "narrowband_gentle"})
+            return True, NARROWBAND_DENOISE_MOD
+        debug(f"Denoise [{filter_name}]: OFF — narrowband (ENABLE_NARROWBAND_DENOISE=False)")
+        emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": False, "reason": "narrowband_disabled"})
         return False, 0.0
 
-    # Multi-filter palette: never — green cast risk
+    # Broadband multi-filter palette (e.g. RGB): never — different frame
+    # counts per channel would pick a different mod per channel below.
     active_narrowband = [f for f in all_detected_filters if f in NARROWBAND_FILTERS]
-    if len(active_narrowband) > 1:
-        debug(f"Denoise [{filter_name}]: OFF — multi-filter palette")
+    active_broadband = [f for f in all_detected_filters if f not in NARROWBAND_FILTERS]
+    if len(active_broadband) > 1:
+        debug(f"Denoise [{filter_name}]: OFF — broadband multi-filter palette")
         emit("progress", "should_apply_denoise_done", params={"filter": filter_name, "apply": False, "reason": "multi_filter_palette"})
         return False, 0.0
 
@@ -734,19 +777,21 @@ def get_stretch_command(
       -3.0 → moderate, good balance on well-calibrated data
       -3.5 → aggressive, clips more noise but risks losing faint structures
 
-    Parameter matrix:
+    Parameter matrix (defaults — see TARGETBG_* / STACK_*_MIN_FRAMES constants):
     ┌─────────────────────────┬─────────────┬──────────┐
     │ Case                    │ shadowsclip │ targetbg │
     ├─────────────────────────┼─────────────┼──────────┤
-    │ OSC broadband, many     │ -3.0        │ 0.20     │
-    │ OSC broadband, medium   │ -2.8        │ 0.23     │
-    │ OSC broadband, short    │ -2.8        │ 0.28     │
-    │ OSC narrowband          │ -2.8        │ 0.15     │
-    │ Mono RGB channel        │ -2.8        │ 0.25     │
-    │ Mono broadband (CLEAR/L)│ -2.8        │ 0.25     │
-    │ Mono NB, well calibrated│ -2.8        │ 0.15     │
-    │ Mono NB, medium         │ -2.8        │ 0.20     │
-    │ Mono NB, short/no DOF   │ -2.8        │ 0.28     │
+    │ OSC broadband, many     │ -3.0        │ 0.17     │
+    │ OSC broadband, medium   │ -2.8        │ 0.20     │
+    │ OSC broadband, short    │ -2.8        │ 0.25     │
+    │ OSC narrowband, good    │ -2.8        │ 0.12     │
+    │ OSC narrowband, medium  │ -2.8        │ 0.17     │
+    │ OSC narrowband, short   │ -2.8        │ 0.26     │
+    │ Mono RGB channel        │ -2.8        │ 0.18-0.25│
+    │ Mono broadband (CLEAR/L)│ -2.8/-3.0   │ 0.20-0.25│
+    │ Mono NB, well calibrated│ -2.8        │ 0.12     │
+    │ Mono NB, medium         │ -2.8        │ 0.17     │
+    │ Mono NB, short/no DOF   │ -2.8        │ 0.26     │
     └─────────────────────────┴─────────────┴──────────┘
     """
     emit("progress", "get_stretch_command_started", params={
@@ -763,8 +808,8 @@ def get_stretch_command(
     is_luminance   = filter_name.upper() in ("L", "LUMINANCE")
 
     # Signal quality score — drives targetbg selection
-    good_stack  = num_files >= 20 and has_masters
-    medium_stack = num_files >= 8  and has_masters
+    good_stack  = num_files >= STACK_GOOD_MIN_FRAMES   and has_masters
+    medium_stack = num_files >= STACK_MEDIUM_MIN_FRAMES and has_masters
     short_stack  = num_files < 6   or not has_masters
 
     def _done(cmds):
@@ -779,43 +824,83 @@ def get_stretch_command(
     # ------------------------------------------------------------------
     if is_color:
         if is_narrowband:
-            # OSC + narrowband clip (e.g. dual-band filter on color camera)
-            # Signal is narrow-band but sensor is color — treat like mono NB
-            return _done(["autostretch -linked -2.8 0.15"])
+            # OSC + narrowband clip (e.g. dual-band filter on color camera).
+            # Signal is narrow-band but sensor is color — treat like mono NB,
+            # including scaling targetbg with stack quality (previously this
+            # branch ignored num_files/has_masters entirely and always used
+            # the "good" value, even on short/uncalibrated stacks).
+            if good_stack:
+                return _done([f"autostretch -linked -2.8 {TARGETBG_NB_GOOD}"])
+            elif medium_stack:
+                return _done([f"autostretch -linked -2.8 {TARGETBG_NB_MEDIUM}"])
+            else:
+                return _done([f"autostretch -linked -2.8 {TARGETBG_NB_SHORT}"])
 
         # OSC broadband (CLEAR, no filter, UHC, CLS...)
+        # Previously 0.20/0.23/0.28, unchanged since before any of this
+        # session's fixes — the RGB-channel and mono-CLEAR fixes only
+        # touched the mono-camera branches above, not this OSC one, so an
+        # OSC DSLR session (e.g. Nikon Z6II) shooting CLEAR never saw any
+        # of that work. Nudged darker here too now, and fixed a missing
+        # _done() call on the medium_stack case (progress event was silently
+        # skipped, no effect on the actual stretch value).
         if good_stack:
             # Enough frames to trust SNR — aggressive clip, dark background
-            return _done(["autostretch -linked -3.0 0.20"])
+            return _done([f"autostretch -linked -3.0 {TARGETBG_OSC_BB_GOOD}"])
         elif medium_stack:
             # Moderate stack — balance between noise rejection and signal preservation
-            return ["autostretch -linked -2.8 0.23"]
+            return _done([f"autostretch -linked -2.8 {TARGETBG_OSC_BB_MEDIUM}"])
         else:
             # Short stack or no calibration — softer clip, brighter targetbg
             # Avoids clipping diffuse nebulosity (M16, M42, M31 outer halos)
-            return _done(["autostretch -linked -2.8 0.28"])
+            return _done([f"autostretch -linked -2.8 {TARGETBG_OSC_BB_SHORT}"])
 
     # ------------------------------------------------------------------
     # MONO CAMERA — RGB individual channels
     # Must use identical parameters across R/G/B to preserve color balance
-    # when channels are later combined by compose_rgb_image.
+    # when channels are later combined by compose_rgb_image. Previously this
+    # was a flat 0.25 regardless of frame count, so a well-calibrated 75+
+    # frame RGB session (e.g. 75/77/76 R/G/B) got the same conservative
+    # background depth as a 5-frame one. Now scales with stack quality like
+    # every other branch — R/G/B channels from the same session normally
+    # have near-identical frame counts, so in practice they land in the same
+    # bucket together; if a session ever splits across buckets (e.g. R=21,
+    # B=19 frames, straddling STACK_GOOD_MIN_FRAMES), channels would get
+    # different targetbg and could show a slight tint mismatch — worth a
+    # cross-channel min() if that's ever observed in practice.
     # ------------------------------------------------------------------
     if is_rgb_channel:
-        return _done(["autostretch -linked -2.8 0.25"])
+        if good_stack:
+            return _done([f"autostretch -linked -2.8 {TARGETBG_RGB_GOOD}"])
+        elif medium_stack:
+            return _done([f"autostretch -linked -2.8 {TARGETBG_RGB_MEDIUM}"])
+        else:
+            return _done([f"autostretch -linked -2.8 {TARGETBG_RGB_SHORT}"])
 
     # ------------------------------------------------------------------
     # MONO CAMERA — broadband (CLEAR, L, LUMINANCE)
+    # CLEAR previously had a flat 0.25 targetbg regardless of frame count —
+    # same bug as the old RGB-channel branch. A 40-frame (M16) or 240-frame
+    # (M42) CLEAR stack is comfortably "good_stack" quality and was getting
+    # the same conservative background depth as a 5-frame stack. Now shares
+    # the same quality-scaled values as L/LUMINANCE (they're the same kind
+    # of panchromatic mono signal).
     # ------------------------------------------------------------------
     if is_luminance:
         if good_stack:
-            return _done(["autostretch -linked -3.0 0.20"])
+            return _done([f"autostretch -linked -3.0 {TARGETBG_MONO_BB_GOOD}"])
         elif medium_stack:
-            return _done(["autostretch -linked -2.8 0.22"])
+            return _done([f"autostretch -linked -2.8 {TARGETBG_MONO_BB_MEDIUM}"])
         else:
-            return _done(["autostretch -linked -2.8 0.25"])
+            return _done([f"autostretch -linked -2.8 {TARGETBG_MONO_BB_SHORT}"])
 
     if is_broadband:
-        return _done(["autostretch -linked -2.8 0.25"])
+        if good_stack:
+            return _done([f"autostretch -linked -2.8 {TARGETBG_MONO_BB_GOOD}"])
+        elif medium_stack:
+            return _done([f"autostretch -linked -2.8 {TARGETBG_MONO_BB_MEDIUM}"])
+        else:
+            return _done([f"autostretch -linked -2.8 {TARGETBG_MONO_BB_SHORT}"])
 
     # ------------------------------------------------------------------
     # UNRECOGNIZED FILTER SAFEGUARD (e.g. UHC, CLS, DUAL_NARROWBAND,
@@ -840,13 +925,13 @@ def get_stretch_command(
     # ------------------------------------------------------------------
     if good_stack:
         # Well-calibrated deep stack — push background dark to reveal faint filaments
-        return _done(["autostretch -linked -2.8 0.15"])
+        return _done([f"autostretch -linked -2.8 {TARGETBG_NB_GOOD}"])
     elif medium_stack:
         # Decent stack — moderate background
-        return _done(["autostretch -linked -2.8 0.20"])
+        return _done([f"autostretch -linked -2.8 {TARGETBG_NB_MEDIUM}"])
     else:
         # Short stack or missing masters — bright targetbg to avoid clipping signal
-        return _done(["autostretch -linked -2.8 0.28"])
+        return _done([f"autostretch -linked -2.8 {TARGETBG_NB_SHORT}"])
 
 
 # --------------------------------------------------------------------------
