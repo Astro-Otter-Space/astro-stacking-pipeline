@@ -73,7 +73,23 @@ BORDER_CROP_PERCENT = 1.5
 # constants below after checking a real render; see reduce_star_halos()
 # docstring for what each one controls.
 ENABLE_STAR_HALO_REDUCTION = True
-STAR_HALO_MASK_THRESHOLD = 88   # percent; only pixels brighter than this (of the image's own luma) are treated as "star" — higher = fewer/brighter-only stars affected
+
+# --- Flat staleness check ---
+# A master flat captured long before/after the light session may no longer
+# match the current optical train (back-focus drift, dust motes, filter or
+# corrector reinstalled) — found in practice on NGC 4565: corners brighter
+# than the frame center (the OPPOSITE of normal optical vignetting, which
+# darkens corners), traced to a master flat dated 2022-10-18 used against a
+# much more recent light session. This only warns, never blocks — the flat
+# might still be fine (some setups are mechanically stable for years).
+FLAT_STALENESS_WARNING_DAYS = 90
+STAR_HALO_MASK_THRESHOLD = 45   # percent; was 88 — measured on a real render (52 Cygni, NGC 6960) that
+                                 # 88% only covers the saturated core (a few dozen px, perceptually invisible
+                                 # at full-frame scale): near-white pixel count dropped 60-83%, but the
+                                 # visually offending glow at 50-150/255 luma only dropped 2-5%. Lowering the
+                                 # threshold brings that mid-brightness glow into the mask so the erosion can
+                                 # actually act on it. Re-verify on the next render; if the glow radius still
+                                 # barely shrinks, go lower still (e.g. 30) before touching ERODE_RADIUS/BLEND.
 STAR_HALO_MASK_FEATHER    = 3   # px blur radius on the mask edge, avoids a visible ring around each treated star
 STAR_HALO_ERODE_RADIUS    = 2   # px; size of the min-filter kernel — larger = more shrinkage but more risk of clipping small stars to nothing
 STAR_HALO_BLEND_PERCENT   = 45  # 0-100; how much of the eroded copy to mix back in within the mask — lower = gentler
@@ -432,6 +448,63 @@ def get_master_bias_path(session_dir: Path, filter_name: str | None = None) -> s
 # --------------------------------------------------------------------------
 # SUBSKY - Gradient Optimization
 # --------------------------------------------------------------------------
+def check_flat_staleness(master_flat_path: str, light_files: list) -> None:
+    """
+    Warn (never block) if the master flat's DATE-OBS is far from the light
+    frames' DATE-OBS. Doesn't fix anything by itself — it's a diagnostic
+    signal for the person running the pipeline to go re-shoot a flat rather
+    than spend time chasing a phantom subsky/code bug.
+
+    Root case that motivated this: NGC 4565 final composite showed all four
+    corners brighter than the frame center — the OPPOSITE of normal optical
+    vignetting (which darkens corners). The master flat in use was dated
+    2022-10-18, likely long before the actual light session. A flat that no
+    longer matches the current optical train (back-focus drift since then,
+    dust motes, filter or corrector removed/reinstalled) will under- or
+    over-correct vignetting in a way that can look exactly like this —
+    brighter corners if the flat's recorded vignetting is now weaker than
+    the light frames' actual vignetting, so dividing by it doesn't fully
+    flatten the field.
+    """
+    if not master_flat_path or not light_files:
+        return
+    try:
+        with fits.open(master_flat_path, ignore_missing_end=True) as hdul:
+            flat_date_str = hdul[0].header.get('DATE-OBS')
+        with fits.open(light_files[0], ignore_missing_end=True) as hdul:
+            light_date_str = hdul[0].header.get('DATE-OBS')
+    except Exception as e:
+        debug(f"Flat staleness check: could not read DATE-OBS ({e}), skipping")
+        return
+
+    if not flat_date_str or not light_date_str:
+        debug("Flat staleness check: DATE-OBS missing on flat or light frame, skipping")
+        return
+
+    try:
+        flat_date = datetime.fromisoformat(flat_date_str.replace('Z', ''))
+        light_date = datetime.fromisoformat(light_date_str.replace('Z', ''))
+    except ValueError as e:
+        debug(f"Flat staleness check: could not parse DATE-OBS ({e}), skipping")
+        return
+
+    age_days = abs((light_date - flat_date).days)
+    if age_days > FLAT_STALENESS_WARNING_DAYS:
+        debug(
+            f"WARNING: master flat is {age_days} days from the light session "
+            f"(flat: {flat_date_str}, lights: {light_date_str}). A gap this "
+            f"large means the flat may no longer represent the current "
+            f"optical train — consider re-shooting it if vignetting/gradient "
+            f"artifacts show up in the final composite."
+        )
+        emit("progress", "flat_staleness_warning", params={
+            "flat_path": str(master_flat_path),
+            "flat_date": flat_date_str,
+            "light_date": light_date_str,
+            "age_days": age_days,
+        })
+
+
 def get_subsky_command(
     filter_name: str,
     num_files: int,
@@ -497,9 +570,17 @@ def get_subsky_command(
 
         # Flat available, not deep narrowband: gentle RBF to handle sky gradient.
         # High smooth prevents over-fitting around bright objects.
+        # samples raised 50->80: a corner-brightening artifact seen on NGC 4565
+        # is more consistent with the RBF undershooting the true background
+        # near corners (sparse sample coverage there) than with the flat
+        # itself (which measured with normal, correctly-shaped vignetting).
+        # More sample points should reduce that risk, but this is a
+        # reasoned adjustment, not a verified fix — the flat's age (see
+        # check_flat_staleness) is at least as likely a contributor and
+        # should be ruled out first on the next real test.
         tolerance = 1.2 if nb_missing == 0 else 1.4
         smooth    = 0.6 if nb_missing == 0 else 0.7
-        cmd = f'subsky -rbf -tolerance={tolerance} -smooth={smooth} -samples=50'
+        cmd = f'subsky -rbf -tolerance={tolerance} -smooth={smooth} -samples=80'
         emit("progress", "get_subsky_command_done", params={"filter": filter_name, "command": cmd})
         return cmd
 
@@ -1000,6 +1081,8 @@ def generate_siril_stack_script(
     is_narrowband = filter_name.upper() in NARROWBAND_FILTERS
     bit_cmd = "set32bits" if output_bits == 32 else "set16bits"
 
+    check_flat_staleness(master_flat_path, light_files)
+
     lines = [
         "requires 1.2.0",
         f'cd "{abs_work_dir}"',
@@ -1062,9 +1145,9 @@ def generate_siril_stack_script(
     # legitimate faint signal starts getting clipped.
     # -------------------------------------------------------------------------
     SIGMA_LOW_WINSORIZED  = 3.0
-    SIGMA_HIGH_WINSORIZED = 2.0   # was 3.0
+    SIGMA_HIGH_WINSORIZED = 3.0
     SIGMA_LOW_LINEAR      = 4.0
-    SIGMA_HIGH_LINEAR     = 2.2   # was 3.0
+    SIGMA_HIGH_LINEAR     = 3.0
 
     if num_files <= 3:
         rejection     = None      # no rejection at all
