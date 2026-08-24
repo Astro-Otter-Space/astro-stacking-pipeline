@@ -448,6 +448,83 @@ def get_master_bias_path(session_dir: Path, filter_name: str | None = None) -> s
 # --------------------------------------------------------------------------
 # SUBSKY - Gradient Optimization
 # --------------------------------------------------------------------------
+def get_frame_dimensions(light_files: list) -> tuple | None:
+    """
+    Read (NAXIS1, NAXIS2) — i.e. (width, height) — from the first light
+    frame's FITS header. Returns None if it can't be determined (missing
+    files, unreadable header, missing NAXIS keywords) so callers can
+    degrade gracefully instead of crashing the whole stack script.
+    """
+    if not light_files:
+        return None
+    try:
+        with fits.open(light_files[0], ignore_missing_end=True) as hdul:
+            header = hdul[0].header
+            width, height = header.get('NAXIS1'), header.get('NAXIS2')
+            if width and height:
+                return int(width), int(height)
+            debug(f"Frame dimensions: NAXIS1/NAXIS2 missing in {light_files[0]}")
+            return None
+    except Exception as e:
+        debug(f"Frame dimensions: could not read {light_files[0]} ({e})")
+        return None
+
+
+def get_early_crop_command(light_files: list, percent: float) -> str:
+    """
+    Returns a Siril 'crop x y width height' command sized to shave
+    BORDER_CROP_PERCENT off each side of the stacked master, computed from
+    the light frames' own resolution (read via FITS header — Siril script
+    syntax has no variables/arithmetic, so this can't be computed inside
+    the .ssf itself).
+
+    Placed right after 'load r_{seq}_stacked.fit', BEFORE subsky, color
+    calibration, denoise, and stretch — moved here (previously this crop
+    only happened much later, in Python, on the final ImageMagick-composed
+    image) after re-reading Siril's own scripting tutorial: cropping should
+    happen before background/gradient extraction, since a registration
+    border fringe still present in the sampled background contaminates the
+    subsky model. This was a real, previously-unexamined gap: the post-stack
+    subsky path (get_subsky_command) ran directly on 'r_{seq}_stacked.fit',
+    which can still carry a partial-coverage edge from register/stack, before
+    any crop ever touched it.
+
+    Cropping once here, per channel, before recombination also closes a
+    second, separately-flagged risk: R/G/B or narrowband channels can each
+    drift by a slightly different amount during their own registration, so
+    a single crop applied post-composition (the old approach) could leave
+    an asymmetric residual fringe if one channel's misalignment exceeded the
+    crop amount. Cropping each channel individually, at its own native
+    resolution, avoids that.
+
+    Returns "" if percent <= 0 or if the frame dimensions can't be read
+    (crop is skipped rather than guessed — an unverified crop box risks
+    cutting into real signal more than leaving a thin border alone would).
+    """
+    if percent <= 0:
+        return ""
+
+    dims = get_frame_dimensions(light_files)
+    if dims is None:
+        debug("Early crop: frame dimensions unavailable, skipping crop")
+        return ""
+
+    width, height = dims
+    shave_x = max(1, round(width * percent / 100))
+    shave_y = max(1, round(height * percent / 100))
+    crop_w = width - 2 * shave_x
+    crop_h = height - 2 * shave_y
+    if crop_w <= 0 or crop_h <= 0:
+        debug(f"Early crop: percent={percent} too large for {width}x{height}, skipping")
+        return ""
+
+    cmd = f"crop {shave_x} {shave_y} {crop_w} {crop_h}"
+    emit("progress", "get_early_crop_command_done", params={
+        "command": cmd, "source_dims": f"{width}x{height}", "percent": percent
+    })
+    return cmd
+
+
 def check_flat_staleness(master_flat_path: str, light_files: list) -> None:
     """
     Warn (never block) if the master flat's DATE-OBS is far from the light
@@ -614,6 +691,16 @@ def get_color_calibration_command(
 
     Siril 1.2: only `pcc` is scriptable, requires NOMAD catalog (network or local).
     Siril 1.4: `cc -nostellar` is available without network or catalog.
+
+    NOTE on -noflip: Siril's own scripting tutorial recommends leaving PCC's
+    auto-flip ("Retourner l'image si nécessaire") ENABLED, since it uses
+    astrometry (a more reliable source of truth than a fixed heuristic).
+    -noflip is used here deliberately, NOT an oversight: this pipeline
+    already applies an unconditional flip downstream, in
+    correct_image_orientation() (see that function's docstring — Siril
+    always stores/processes bottom-up regardless of ROWORDER). If PCC also
+    flipped, the two flips would cancel out and undo the correction. These
+    two are coupled: don't change one without checking the other.
 
     Never apply on:
       - Mono camera (no color channels to balance)
@@ -1233,6 +1320,12 @@ def generate_siril_stack_script(
         f"load r_{seq}_stacked.fit",
     ])
 
+    # Early crop — see get_early_crop_command() docstring for why this moved
+    # here instead of staying a post-composition Python-side step.
+    early_crop_cmd = get_early_crop_command(light_files or [], BORDER_CROP_PERCENT)
+    if early_crop_cmd:
+        lines.append(early_crop_cmd)
+
     # 8. Post-stack processing
     apply_denoise, denoise_mod = should_apply_denoise(
         filter_name, num_files, is_color,
@@ -1367,11 +1460,24 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
 # --------------------------------------------------------------------------
 def crop_registration_border(image_path: Path, percent: float) -> bool:
     """
-    Shave a percentage of the border off each side of the final composed
-    image to remove registration artifacts: thin fringes of black, noisy,
-    or mis-colored pixels along one or more edges where not every aligned
-    frame contributed data (visible e.g. as a stray-hued line along the
-    top edge on multi-channel composites).
+    UNUSED as of the early-crop change — kept for reference/rollback, not
+    called anywhere in the current pipeline.
+
+    Originally shaved a percentage of the border off each side of the
+    FINAL composed image (post-ImageMagick composition) to remove
+    registration artifacts: thin fringes of black, noisy, or mis-colored
+    pixels along one or more edges where not every aligned frame
+    contributed data (visible e.g. as a stray-hued line along the top edge
+    on multi-channel composites).
+
+    Superseded by get_early_crop_command(), which crops each channel
+    individually INSIDE Siril, right after stacking and before subsky —
+    closer to the source of the artifact, and avoids the subsky
+    contamination and per-channel asymmetric-fringe risks that this
+    post-composition approach couldn't address. See that function's
+    docstring for the full reasoning. If early-crop is ever disabled and
+    this needs reviving, call it from compose_rgb_image again where the
+    two "Border crop now happens earlier..." comments currently sit.
 
     Percentage is computed independently per axis from the image's own
     dimensions so it scales correctly regardless of output resolution.
@@ -1614,7 +1720,10 @@ def compose_rgb_image(
             if not success:
                 debug(f"ImageMagick STDERR (MONO): {result.stderr}")
             if success:
-                crop_registration_border(output_file, BORDER_CROP_PERCENT)
+                # Border crop now happens earlier, per-channel, inside the
+                # Siril .ssf script (see get_early_crop_command()) — no
+                # longer needed here. Calling crop_registration_border again
+                # on this already-cropped image would double-crop it.
                 reduce_star_halos(output_file)
             emit("progress", "compose_rgb_image_done", params={"palette": "MONO", "success": success})
             return success
@@ -1883,7 +1992,10 @@ def compose_rgb_image(
         success = result.returncode == 0
         emit("progress", "imagemagick_done", params={"palette": palette_label, "success": success})
         if success:
-            crop_registration_border(output_file, BORDER_CROP_PERCENT)
+            # Border crop now happens earlier, per-channel, inside the
+            # Siril .ssf script (see get_early_crop_command()) — no longer
+            # needed here. Calling crop_registration_border again on this
+            # already-cropped image would double-crop it.
             reduce_star_halos(output_file)
         emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": success})
         return success
