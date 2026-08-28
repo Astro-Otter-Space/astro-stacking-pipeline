@@ -1601,6 +1601,40 @@ def reduce_star_halos(image_path: Path) -> bool:
         return False
 
 
+LOSSY_OUTPUT_FORMATS = {"webp", "jpg", "jpeg"}
+
+
+def get_composition_paths(session_dir: Path, file_prefix: str, output_format: str) -> tuple:
+    """
+    Returns (work_path, final_path) for the composition pipeline.
+
+    work_path is where compose_rgb_image (ImageMagick) and reduce_star_halos
+    (PIL) both read/write, and is ALWAYS a lossless format (.tif) when the
+    user requested a lossy final format (webp/jpg). final_path is the actual
+    requested output (f"{file_prefix}_full.{output_format}").
+
+    Why: these two steps used to write directly to the final webp/jpg, and
+    correct_image_orientation (running after them) opened and re-saved that
+    same lossy file again — meaning a webp/jpg output went through 2-3
+    separate lossy re-encodes (compose -> halo reduction -> orientation
+    flip), each pass quietly degrading fine detail a bit more. Confirmed on
+    a real M16 render: the webp output had ~10% lower background noise
+    std-dev than an equivalent TIFF of the same underlying data — consistent
+    with repeated lossy compression smoothing out grain, not a processing
+    difference. Now only correct_image_orientation (the last step in the
+    pipeline) does the one-time lossy encode, into final_path.
+
+    For an already-lossless target (png/tiff), work_path == final_path —
+    nothing changes for those, no extra conversion step needed.
+    """
+    final_path = session_dir / f"{file_prefix}_full.{output_format}"
+    if output_format.lower() in LOSSY_OUTPUT_FORMATS:
+        work_path = session_dir / f"{file_prefix}_full.tif"
+    else:
+        work_path = final_path
+    return work_path, final_path
+
+
 def compose_rgb_image(
     session_dir: Path,
     tif_files: dict,
@@ -1634,7 +1668,7 @@ def compose_rgb_image(
         "output_format": output_format,
     })
 
-    output_file = session_dir / f"{file_prefix}_full.{output_format}"
+    output_file, _final_output_file = get_composition_paths(session_dir, file_prefix, output_format)
 
     # Resolve reference geometry for synthetic black channels
     ref_path = next(iter(tif_files.values()))
@@ -1710,8 +1744,10 @@ def compose_rgb_image(
             "-sigmoidal-contrast", "3x48%",
             "-unsharp", "0x1.0+0.5+0.02",
         ]
-        if output_format in ["webp", "jpg"]:
-            cmd.extend(["-quality", "95"])
+        # No -quality flag here: output_file is always the lossless work_path
+        # now (see get_composition_paths) — the one-time lossy encode, if
+        # the user requested webp/jpg, happens later in
+        # correct_image_orientation, the pipeline's last step.
         cmd.append(str(output_file))
         try:
             result = subprocess.run(
@@ -1975,8 +2011,10 @@ def compose_rgb_image(
         # Safety fallback — should never be reached with the palette logic above
         cmd.extend(["-level", "2%,98%"])
 
-    if output_format in ["webp", "jpg"]:
-        cmd.extend(["-quality", "95"])
+    # No -quality flag here: output_file is always the lossless work_path now
+    # (see get_composition_paths) — the one-time lossy encode, if the user
+    # requested webp/jpg, happens later in correct_image_orientation, the
+    # pipeline's last step.
 
     cmd.append(str(output_file))
 
@@ -2027,7 +2065,7 @@ def get_image_dimensions(ref_path: Path) -> tuple:
         return (2048, 2048)
 
 
-def correct_image_orientation(image_path: Path, fits_source_path: Path = None) -> None:
+def correct_image_orientation(image_path: Path, fits_source_path: Path = None, final_path: Path = None) -> None:
     """
     Flip the image vertically to correct FITS bottom-up storage convention.
 
@@ -2045,15 +2083,32 @@ def correct_image_orientation(image_path: Path, fits_source_path: Path = None) -
     other tools — e.g. SharpCap/INDI writers. That assumption doesn't hold for
     Siril and produced upside-down composites. Do not reintroduce that check
     without first confirming Siril's ROWORDER semantics have changed.)
+
+    final_path: if given and different from image_path, this call also
+    performs the pipeline's ONE-AND-ONLY lossy encode (webp/jpg, quality=95)
+    here, writing the flipped result to final_path and deleting the
+    lossless intermediate (image_path) afterward. This function runs last
+    in the pipeline (called from run(), after compose_rgb_image and
+    reduce_star_halos have both already finished), which is why it's the
+    right place to do this — see get_composition_paths()'s docstring for
+    the full reasoning on why the earlier steps deliberately avoid writing
+    lossy output directly. If final_path is None or equal to image_path,
+    behavior is unchanged: flip in place.
     """
     emit("progress", "correct_image_orientation_started", params={"file": image_path.name})
 
+    target = final_path if final_path is not None else image_path
     try:
         with Image.open(image_path) as img:
             flipped = ImageOps.flip(img)  # vertical flip (top-bottom), matches ImageMagick -flip
-            save_kwargs = {"quality": 95} if image_path.suffix.lower() in (".webp", ".jpg", ".jpeg") else {}
-            flipped.save(image_path, **save_kwargs)
-        emit("progress", "correct_image_orientation_done", params={"file": image_path.name, "flipped": True})
+            save_kwargs = {"quality": 95} if target.suffix.lower() in (".webp", ".jpg", ".jpeg") else {}
+            flipped.save(target, **save_kwargs)
+        if final_path is not None and final_path != image_path:
+            try:
+                image_path.unlink(missing_ok=True)
+            except Exception as e:
+                debug(f"Could not remove lossless intermediate {image_path.name}: {e}")
+        emit("progress", "correct_image_orientation_done", params={"file": target.name, "flipped": True})
     except Exception as e:
         debug(f"Orientation flip failed: {e}")
         emit("progress", "correct_image_orientation_done", params={"file": image_path.name, "flipped": False, "error": str(e)})
@@ -2591,11 +2646,11 @@ def run(args) -> bool:
         debug(f"Final clean-up failed : {e}")
 
     if composite_success:
-        final_image = current_session_dir / f"{file_prefix}_full.{format_requested}"
-        if final_image.is_file():
-            emit("progress", "orientation_correction", params={"file": final_image.name})
+        work_image, final_image = get_composition_paths(current_session_dir, file_prefix, format_requested)
+        if work_image.is_file():
+            emit("progress", "orientation_correction", params={"file": work_image.name})
             last_stacked = next(iter(master_files_map.values()), None)
-            correct_image_orientation(final_image, fits_source_path=last_stacked)
+            correct_image_orientation(work_image, fits_source_path=last_stacked, final_path=final_image)
 
             end = datetime.now()
             elapsed = end - start
