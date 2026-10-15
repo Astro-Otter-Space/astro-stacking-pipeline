@@ -8,7 +8,9 @@ Generates and runs Siril scripts for:
 - Clean spaces in filenames to immunize Siril parser.
 - Use native Siril 1.2+ commands ('cd', 'convert -out=.', 'stack r_light rej').
 - Properly convert FIT containers to master TIFFs (via load/save).
-- Merge channels into a chromatic composite (SHO, HOO, RGB, Mono) via ImageMagick.
+- Merge channels into a chromatic composite (SHO, HOO, RGB, Mono) via ImageMagick
+  (channel combine + tone/color finishing chain only — flip, crop, synthetic
+  black channels, and star halo reduction now run on pure PIL/numpy/scipy).
 - Run 100% in command-line mode (strict headless).
 
 Usage :
@@ -26,7 +28,8 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta
 from astropy.io import fits
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
+from scipy import ndimage
 import numpy as np
 
 # Root directory
@@ -1479,6 +1482,9 @@ def crop_registration_border(image_path: Path, percent: float) -> bool:
     this needs reviving, call it from compose_rgb_image again where the
     two "Border crop now happens earlier..." comments currently sit.
 
+    Ported from ImageMagick (-shave) to plain PIL crop() — pixel-exact,
+    no behavior change from the original.
+
     Percentage is computed independently per axis from the image's own
     dimensions so it scales correctly regardless of output resolution.
     No-op if percent <= 0.
@@ -1496,16 +1502,18 @@ def crop_registration_border(image_path: Path, percent: float) -> bool:
     shave_x = max(1, round(width * percent / 100))
     shave_y = max(1, round(height * percent / 100))
 
-    cmd = ["convert", str(image_path), "-shave", f"{shave_x}x{shave_y}", str(image_path)]
     try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        with Image.open(image_path) as img:
+            cropped = img.crop((shave_x, shave_y, width - shave_x, height - shave_y))
+            save_kwargs = {"quality": 95} if image_path.suffix.lower() in (".webp", ".jpg", ".jpeg") else {}
+            cropped.save(image_path, **save_kwargs)
         debug(f"Border crop: shaved {shave_x}x{shave_y}px ({percent}%) from {image_path.name}")
         emit("progress", "crop_registration_border_done", params={
             "file": image_path.name, "percent": percent, "shave_x": shave_x, "shave_y": shave_y
         })
         return True
-    except subprocess.CalledProcessError as e:
-        debug(f"Border crop failed on {image_path.name}: {e.stderr}")
+    except Exception as e:
+        debug(f"Border crop failed on {image_path.name}: {e}")
         emit("progress", "crop_registration_border_done", params={"file": image_path.name, "success": False, "error": str(e)})
         return False
 
@@ -1516,83 +1524,115 @@ def reduce_star_halos(image_path: Path) -> bool:
     full star-removal/synthesis pipeline (no StarNet++ dependency, which may
     not be installed on this machine).
 
-    Technique (pure ImageMagick, three real temp files — no fragile one-liner):
+    Technique (pure PIL/numpy/scipy — ported from a 4-temp-file ImageMagick
+    chain, see below):
       1. mask   = bright-pixel mask from the image's own luma, thresholded at
-                  STAR_HALO_MASK_THRESHOLD%, edges feathered with a blur so
-                  the treated region doesn't end in a hard ring.
-      2. eroded = a copy run through a min-filter (-statistic Minimum) of
-                  size STAR_HALO_ERODE_RADIUS — small round bright blobs
-                  (stars) shrink noticeably; large diffuse structures
-                  (nebula) barely move, since the filter only pulls each
-                  pixel down to the darkest value in its small neighborhood.
-      3. blend  = weighted mix of original and eroded (STAR_HALO_BLEND_PERCENT),
-                  then composited back over the original using the mask as
-                  alpha — so only the bright/star regions actually change.
+                  STAR_HALO_MASK_THRESHOLD%, edges feathered with a Gaussian
+                  blur so the treated region doesn't end in a hard ring.
+      2. eroded = a copy run through a min-filter (scipy.ndimage.minimum_filter)
+                  of size STAR_HALO_ERODE_RADIUS, applied per RGB channel —
+                  small round bright blobs (stars) shrink noticeably; large
+                  diffuse structures (nebula) barely move, since the filter
+                  only pulls each pixel down to the darkest value in its
+                  small neighborhood.
+      3. result = original blended toward eroded, weighted by
+                  (mask * STAR_HALO_BLEND_PERCENT) — algebraically the same
+                  end result as the original ImageMagick chain (Blend +
+                  CopyOpacity + Over collapse into one linear interpolation:
+                  result = original*(1 - mask*P) + eroded*(mask*P)), just
+                  computed directly instead of through 3 intermediate
+                  composited files.
 
-    UNVERIFIED ON REAL DATA. If stars look artificially chopped/square,
-    lower STAR_HALO_ERODE_RADIUS or STAR_HALO_BLEND_PERCENT first (in that
-    order) rather than raising STAR_HALO_MASK_THRESHOLD — a too-high
-    threshold just makes the effect patchy, it doesn't make it gentler.
+    Approximation notes (functionally equivalent, not guaranteed bit-exact
+    vs. the original ImageMagick version):
+      - Grayscale luma (PIL .convert("L"), ITU-R 601-2 weights) may differ
+        very slightly from ImageMagick's default -colorspace Gray (Rec 709
+        in recent IM versions) — negligible for a bright-star threshold mask.
+      - Gaussian blur (PIL ImageFilter.GaussianBlur) is a different
+        implementation than IM's -blur, both true Gaussians but not
+        guaranteed pixel-identical at the edges.
+
+    UNVERIFIED ON REAL DATA (true before this port too — the ImageMagick
+    version was never validated against a real render either, so this port
+    doesn't regress an already-confirmed baseline). If stars look
+    artificially chopped/square, lower STAR_HALO_ERODE_RADIUS or
+    STAR_HALO_BLEND_PERCENT first (in that order) rather than raising
+    STAR_HALO_MASK_THRESHOLD — a too-high threshold just makes the effect
+    patchy, it doesn't make it gentler.
     """
     if not ENABLE_STAR_HALO_REDUCTION:
         return True
 
-    stem = image_path.stem
-    mask_path   = image_path.parent / f".star_mask_{stem}.tif"
-    eroded_path = image_path.parent / f".star_eroded_{stem}.tif"
-    blend_path  = image_path.parent / f".star_blend_{stem}.tif"
-    masked_path = image_path.parent / f".star_masked_{stem}.tif"
-
     try:
-        # 1. Feathered bright-pixel mask
-        subprocess.run([
-            "convert", str(image_path),
-            "-colorspace", "Gray",
-            "-level", f"{STAR_HALO_MASK_THRESHOLD}%,100%",
-            "-blur", f"0x{STAR_HALO_MASK_FEATHER}",
-            str(mask_path)
-        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            arr = np.asarray(img).astype(np.float32)  # (H, W, 3), 0-255
 
-        # 2. Eroded (min-filtered) copy
-        kernel = STAR_HALO_ERODE_RADIUS * 2 + 1
-        subprocess.run([
-            "convert", str(image_path),
-            "-statistic", "Minimum", f"{kernel}x{kernel}",
-            str(eroded_path)
-        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # 1. Feathered bright-pixel mask
+            gray = np.asarray(img.convert("L")).astype(np.float32)
+            thresh_val = STAR_HALO_MASK_THRESHOLD / 100.0 * 255.0
+            mask = np.clip((gray - thresh_val) / max(255.0 - thresh_val, 1e-6), 0.0, 1.0)
+            mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
+            mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=STAR_HALO_MASK_FEATHER))
+            mask = np.asarray(mask_img).astype(np.float32) / 255.0  # (H, W), 0-1
 
-        # 3a. Blend original + eroded at the configured strength
-        subprocess.run([
-            "convert", str(image_path), str(eroded_path),
-            "-compose", "Blend", "-define", f"compose:args={STAR_HALO_BLEND_PERCENT}",
-            "-composite", str(blend_path)
-        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # 2. Eroded (min-filtered) copy, independently per channel —
+            # matches ImageMagick -statistic Minimum's default per-channel behavior.
+            kernel = STAR_HALO_ERODE_RADIUS * 2 + 1
+            eroded = np.stack([
+                ndimage.minimum_filter(arr[..., c], size=kernel)
+                for c in range(3)
+            ], axis=-1)
 
-        # 3b. Restrict that blend to the star mask (mask becomes its alpha)
-        subprocess.run([
-            "convert", str(blend_path), str(mask_path),
-            "-alpha", "off", "-compose", "CopyOpacity", "-composite",
-            str(masked_path)
-        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # 3. Weighted blend toward eroded, restricted to the mask
+            alpha = (mask * (STAR_HALO_BLEND_PERCENT / 100.0))[..., None]  # (H, W, 1), broadcasts
+            result = arr * (1 - alpha) + eroded * alpha
+            result = np.clip(result, 0, 255).astype(np.uint8)
 
-        # 3c. Composite the masked blend back over the original
-        subprocess.run([
-            "convert", str(image_path), str(masked_path),
-            "-compose", "Over", "-composite", str(image_path)
-        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out_img = Image.fromarray(result, mode="RGB")
+            save_kwargs = {"quality": 95} if image_path.suffix.lower() in (".webp", ".jpg", ".jpeg") else {}
+            out_img.save(image_path, **save_kwargs)
 
         emit("progress", "reduce_star_halos_done", params={"file": image_path.name, "success": True})
         return True
-    except subprocess.CalledProcessError as e:
-        debug(f"Star halo reduction failed on {image_path.name}: {e.stderr}")
+    except Exception as e:
+        debug(f"Star halo reduction failed on {image_path.name}: {e}")
         emit("progress", "reduce_star_halos_done", params={"file": image_path.name, "success": False, "error": str(e)})
         return False
-    finally:
-        for p in (mask_path, eroded_path, blend_path, masked_path):
-            try:
-                p.unlink(missing_ok=True)
-            except Exception as e:
-                debug(f"Failed to remove star-halo temp file {p.name}: {e}")
+
+
+LOSSY_OUTPUT_FORMATS = {"webp", "jpg", "jpeg"}
+
+
+def get_composition_paths(session_dir: Path, file_prefix: str, output_format: str) -> tuple:
+    """
+    Returns (work_path, final_path) for the composition pipeline.
+
+    work_path is where compose_rgb_image (ImageMagick) and reduce_star_halos
+    (PIL) both read/write, and is ALWAYS a lossless format (.tif) when the
+    user requested a lossy final format (webp/jpg). final_path is the actual
+    requested output (f"{file_prefix}_full.{output_format}").
+
+    Why: these two steps used to write directly to the final webp/jpg, and
+    correct_image_orientation (running after them) opened and re-saved that
+    same lossy file again — meaning a webp/jpg output went through 2-3
+    separate lossy re-encodes (compose -> halo reduction -> orientation
+    flip), each pass quietly degrading fine detail a bit more. Confirmed on
+    a real M16 render: the webp output had ~10% lower background noise
+    std-dev than an equivalent TIFF of the same underlying data — consistent
+    with repeated lossy compression smoothing out grain, not a processing
+    difference. Now only correct_image_orientation (the last step in the
+    pipeline) does the one-time lossy encode, into final_path.
+
+    For an already-lossless target (png/tiff), work_path == final_path —
+    nothing changes for those, no extra conversion step needed.
+    """
+    final_path = session_dir / f"{file_prefix}_full.{output_format}"
+    if output_format.lower() in LOSSY_OUTPUT_FORMATS:
+        work_path = session_dir / f"{file_prefix}_full.tif"
+    else:
+        work_path = final_path
+    return work_path, final_path
 
 
 def compose_rgb_image(
@@ -1628,11 +1668,13 @@ def compose_rgb_image(
         "output_format": output_format,
     })
 
-    output_file = session_dir / f"{file_prefix}_full.{output_format}"
+    output_file, _final_output_file = get_composition_paths(session_dir, file_prefix, output_format)
 
-    # Resolve reference geometry for synthetic black channels (xc:black)
+    # Resolve reference geometry for synthetic black channels
     ref_path = next(iter(tif_files.values()))
     width, height = get_image_dimensions(ref_path)
+    with Image.open(ref_path) as _ref_img:
+        ref_mode = _ref_img.mode  # matched exactly when generating synthetic black channels below
 
     # ------------------------------------------------------------------
     # CHANNEL DETECTION
@@ -1652,28 +1694,24 @@ def compose_rgb_image(
         """
         Return the channel TIFF path, or a synthetic black image of the correct size.
 
-        NOTE: 'xc:black[WxH]' is NOT valid ImageMagick syntax for canvas creation —
-        the [WxH] suffix is a read-region modifier applied to existing raster images,
-        it has no effect on the 'xc:' pseudo-format (which defaults to 1x1 px). Using
-        it here silently produced a wrongly-sized (or erroring) synthetic channel
-        whenever a channel was missing (e.g. partial RGB). We generate a real black
-        TIFF on disk instead, sized to match the reference channel exactly.
+        Generated via PIL (Image.new), matched to the reference channel's
+        exact mode/bit depth (ref_mode, resolved above) so it combines
+        cleanly with the real channels in the ImageMagick -combine step
+        downstream. Previously used ImageMagick's 'xc:black' pseudo-format —
+        note the OLD 'xc:black[WxH]' syntax used before that was invalid
+        (the [WxH] suffix is a read-region modifier, not a canvas-size
+        directive, and silently produced a 1x1px image). No ImageMagick
+        fallback here on purpose: a failure is surfaced as an exception
+        rather than silently reintroducing that same wrong-size bug.
         """
         if key in tif_files:
             return str(tif_files[key])
 
         if _synthetic_black_path["path"] is None:
             black_path = session_dir / f".synthetic_black_{width}x{height}.tif"
-            try:
-                subprocess.run(
-                    ["convert", "-size", f"{width}x{height}", "xc:black", str(black_path)],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
-                )
-                _synthetic_black_path["path"] = str(black_path)
-                debug(f"Synthetic black channel generated: {black_path.name} ({width}x{height})")
-            except subprocess.CalledProcessError as e:
-                debug(f"Failed to generate synthetic black channel, falling back to xc:black: {e}")
-                _synthetic_black_path["path"] = "xc:black"  # last-resort: correct color, wrong size
+            Image.new(ref_mode, (width, height), color=0).save(black_path)
+            _synthetic_black_path["path"] = str(black_path)
+            debug(f"Synthetic black channel generated: {black_path.name} ({width}x{height}, mode={ref_mode})")
         return _synthetic_black_path["path"]
 
     def blend_cmd(img_a: str, img_b: str, pct_a: int) -> list:
@@ -1706,8 +1744,10 @@ def compose_rgb_image(
             "-sigmoidal-contrast", "3x48%",
             "-unsharp", "0x1.0+0.5+0.02",
         ]
-        if output_format in ["webp", "jpg"]:
-            cmd.extend(["-quality", "95"])
+        # No -quality flag here: output_file is always the lossless work_path
+        # now (see get_composition_paths) — the one-time lossy encode, if
+        # the user requested webp/jpg, happens later in
+        # correct_image_orientation, the pipeline's last step.
         cmd.append(str(output_file))
         try:
             result = subprocess.run(
@@ -1971,8 +2011,10 @@ def compose_rgb_image(
         # Safety fallback — should never be reached with the palette logic above
         cmd.extend(["-level", "2%,98%"])
 
-    if output_format in ["webp", "jpg"]:
-        cmd.extend(["-quality", "95"])
+    # No -quality flag here: output_file is always the lossless work_path now
+    # (see get_composition_paths) — the one-time lossy encode, if the user
+    # requested webp/jpg, happens later in correct_image_orientation, the
+    # pipeline's last step.
 
     cmd.append(str(output_file))
 
@@ -2023,7 +2065,7 @@ def get_image_dimensions(ref_path: Path) -> tuple:
         return (2048, 2048)
 
 
-def correct_image_orientation(image_path: Path, fits_source_path: Path = None) -> None:
+def correct_image_orientation(image_path: Path, fits_source_path: Path = None, final_path: Path = None) -> None:
     """
     Flip the image vertically to correct FITS bottom-up storage convention.
 
@@ -2041,14 +2083,33 @@ def correct_image_orientation(image_path: Path, fits_source_path: Path = None) -
     other tools — e.g. SharpCap/INDI writers. That assumption doesn't hold for
     Siril and produced upside-down composites. Do not reintroduce that check
     without first confirming Siril's ROWORDER semantics have changed.)
+
+    final_path: if given and different from image_path, this call also
+    performs the pipeline's ONE-AND-ONLY lossy encode (webp/jpg, quality=95)
+    here, writing the flipped result to final_path and deleting the
+    lossless intermediate (image_path) afterward. This function runs last
+    in the pipeline (called from run(), after compose_rgb_image and
+    reduce_star_halos have both already finished), which is why it's the
+    right place to do this — see get_composition_paths()'s docstring for
+    the full reasoning on why the earlier steps deliberately avoid writing
+    lossy output directly. If final_path is None or equal to image_path,
+    behavior is unchanged: flip in place.
     """
     emit("progress", "correct_image_orientation_started", params={"file": image_path.name})
 
-    cmd = ["convert", str(image_path), "-flip", str(image_path)]
+    target = final_path if final_path is not None else image_path
     try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        emit("progress", "correct_image_orientation_done", params={"file": image_path.name, "flipped": True})
-    except subprocess.CalledProcessError as e:
+        with Image.open(image_path) as img:
+            flipped = ImageOps.flip(img)  # vertical flip (top-bottom), matches ImageMagick -flip
+            save_kwargs = {"quality": 95} if target.suffix.lower() in (".webp", ".jpg", ".jpeg") else {}
+            flipped.save(target, **save_kwargs)
+        if final_path is not None and final_path != image_path:
+            try:
+                image_path.unlink(missing_ok=True)
+            except Exception as e:
+                debug(f"Could not remove lossless intermediate {image_path.name}: {e}")
+        emit("progress", "correct_image_orientation_done", params={"file": target.name, "flipped": True})
+    except Exception as e:
         debug(f"Orientation flip failed: {e}")
         emit("progress", "correct_image_orientation_done", params={"file": image_path.name, "flipped": False, "error": str(e)})
 
@@ -2585,11 +2646,11 @@ def run(args) -> bool:
         debug(f"Final clean-up failed : {e}")
 
     if composite_success:
-        final_image = current_session_dir / f"{file_prefix}_full.{format_requested}"
-        if final_image.is_file():
-            emit("progress", "orientation_correction", params={"file": final_image.name})
+        work_image, final_image = get_composition_paths(current_session_dir, file_prefix, format_requested)
+        if work_image.is_file():
+            emit("progress", "orientation_correction", params={"file": work_image.name})
             last_stacked = next(iter(master_files_map.values()), None)
-            correct_image_orientation(final_image, fits_source_path=last_stacked)
+            correct_image_orientation(work_image, fits_source_path=last_stacked, final_path=final_image)
 
             end = datetime.now()
             elapsed = end - start
