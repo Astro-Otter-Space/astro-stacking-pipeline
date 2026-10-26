@@ -78,6 +78,38 @@ BORDER_CROP_PERCENT = 1.5
 # docstring for what each one controls.
 ENABLE_STAR_HALO_REDUCTION = True
 
+# --- Nebula detail boost (structure sharpening) ---
+# Extra sharpening applied last, on LUMINANCE only, on 1.5-8 px structures
+# (nebula edges, dust lanes), with noise coring: band coefficients below
+# DETAIL_BOOST_NOISE_K x the measured band noise are discarded, so grain is
+# not amplified. Tuned on a real M16 render (OSC, 8-bit): strength 2.0 / k 3.0
+# left sky noise unchanged and raised edge gradient ~+40 %. A first version
+# WITHOUT coring (strength 1.0) made the sky visibly blotchier — do not
+# remove the coring. 0 disables the boost; lower k = more aggressive.
+DETAIL_BOOST_STRENGTH = 2.0
+DETAIL_BOOST_NOISE_K = 3.0
+# Star protection: the boost is faded out where luminance is high (star cores
+# and their wings, bright nebula cores), because on M1 the unprotected boost
+# enlarged stars (+60 % half-max area, 3.6x more clipped pixels). Fully
+# active below LO, fully off above HI (luminance 0-1), mask grown by GROW px.
+# Tested on M1 SHO: stars unchanged, nebula edge sharpness +28 %. Lower
+# LO/HI values protect more but start eroding star wings (dark rings).
+DETAIL_BOOST_PROTECT_LO = 0.5
+DETAIL_BOOST_PROTECT_HI = 0.8
+DETAIL_BOOST_PROTECT_GROW = 9
+
+# --- Script version (written to the log at start, see main()) ---
+# Lets a log prove WHICH script produced a render. Bump on every change.
+SCRIPT_VERSION = "2026-10-26.1"
+
+# --- SHO green level ---
+# '-level 0%,N%' on the Green channel of SHO/SHO+RGB. NOTE: N < 100 BRIGHTENS
+# green (gain 100/N: 95 -> x1.053, clipped at white); it does not reduce it,
+# contrary to what the original comment claimed. Kept at 95 to preserve the
+# look validated so far; set to 100 to remove the green gain, or above 100
+# (e.g. 105) to actually reduce green.
+SHO_GREEN_LEVEL_WHITE_PCT = 95
+
 # --- Flat staleness check ---
 # A master flat captured long before/after the light session may no longer
 # match the current optical train (back-focus drift, dust motes, filter or
@@ -1887,6 +1919,53 @@ def compose_rgb_image(
         out = arr + np.where(mask, amount * diff, 0.0)
         return np.clip(out, 0.0, 1.0)
 
+    def apply_detail_boost(arr: np.ndarray, strength: float) -> np.ndarray:
+        """Boost mid-scale structure (nebula edges, dust lanes) on luminance
+        only, with noise coring. Two difference-of-Gaussians bands (1.5-3 px
+        and 3-8 px) are measured on the luminance; for each band the noise
+        level is estimated from the image itself (MAD) and every coefficient
+        below DETAIL_BOOST_NOISE_K x that level is zeroed (soft threshold),
+        so only structure that clearly exceeds the grain is added back. RGB
+        channels are then rescaled by the luminance ratio, preserving hue.
+        Without the coring (plain band boost), a real M16 render got visibly
+        blotchier: sky noise at 2 px scale +50 % for +25 % edge sharpness.
+        With coring: sky noise unchanged, edge sharpness +40-45 %."""
+        if strength <= 0:
+            return arr
+        is_color = (arr.ndim == 3)
+        lum = arr.mean(axis=-1) if is_color else arr
+        g = lambda s: ndimage.gaussian_filter(lum, s)
+        add = np.zeros_like(lum)
+        for weight, band in ((1.0, g(1.5) - g(3.0)), (0.6, g(3.0) - g(8.0))):
+            sigma = 1.4826 * np.median(np.abs(band - np.median(band)))
+            cored = np.sign(band) * np.maximum(np.abs(band) - DETAIL_BOOST_NOISE_K * sigma, 0.0)
+            add += weight * cored
+        # Fade the boost out on bright structures (stars + their wings).
+        core = np.clip((lum - DETAIL_BOOST_PROTECT_LO)
+                       / (DETAIL_BOOST_PROTECT_HI - DETAIL_BOOST_PROTECT_LO), 0.0, 1.0)
+        protect = np.clip(ndimage.gaussian_filter(
+            ndimage.maximum_filter(core, size=DETAIL_BOOST_PROTECT_GROW), 2.0), 0.0, 1.0)
+        add = add * (1.0 - protect)
+        boosted = np.clip(lum + strength * add, 0.0, 1.0)
+        if not is_color:
+            return boosted
+        ratio = (boosted + 1e-6) / (lum + 1e-6)
+        return np.clip(arr * ratio[..., None], 0.0, 1.0)
+
+    def sky_color_stats(arr: np.ndarray) -> dict:
+        """Sky median per channel (0-255) + green balance, for the log."""
+        if arr.ndim != 3 or arr.shape[-1] != 3:
+            return {}
+        lum = arr.mean(axis=-1)
+        sky = lum <= np.percentile(lum, 30)  # darkest 30 % of pixels = sky
+        med = [float(np.median(arr[..., c][sky])) * 255.0 for c in range(3)]
+        mean = arr.reshape(-1, 3).mean(axis=0) * 255.0
+        return {
+            "sky_rgb": [round(v, 1) for v in med],
+            "mean_rgb": [round(float(v), 1) for v in mean],
+            "green_balance": round(float(mean[1] / max((mean[0] + mean[2]) / 2.0, 1e-6)), 3),
+        }
+
     def apply_auto_level_region_per_channel(arr: np.ndarray, x: int, y: int, w: int, h: int) -> np.ndarray:
         """Replacement for '-region WxH+x+y -auto-level +region', using
         genuine PER-CHANNEL independent min/max normalization sampled from
@@ -1935,6 +2014,7 @@ def compose_rgb_image(
             arr = apply_level(arr, 1, 99)
             arr = apply_sigmoidal_contrast(arr, 3, 48)
             arr = apply_unsharp(arr, 1.0, 0.5, 0.02)
+            arr = apply_detail_boost(arr, DETAIL_BOOST_STRENGTH)
             out8 = _from_float01_to_uint8(arr)
             tifffile.imwrite(str(output_file), out8)
             success = True
@@ -2241,10 +2321,9 @@ def compose_rgb_image(
                 arr = apply_sigmoidal_contrast(arr, 3, 45)
                 arr = apply_modulate_saturation(arr, 135)
                 arr = apply_unsharp(arr, 1.0, 0.5, 0.01)
-                # Subtle green cast reduction: HA mapped to Green introduces
-                # a yellow-green tint on stars; pulling the Green ceiling to
-                # 95% neutralizes it without affecting nebula hue much.
-                arr = apply_channel_level(arr, 1, 0, 95)  # channel 1 = Green
+                # Green level (see SHO_GREEN_LEVEL_WHITE_PCT): with the
+                # default 95 this is a +5.3 % green GAIN, not a reduction.
+                arr = apply_channel_level(arr, 1, 0, SHO_GREEN_LEVEL_WHITE_PCT)  # channel 1 = Green
 
             elif palette_label == "HOO":
                 arr = apply_level(arr, 0.5, 99.5)
@@ -2294,6 +2373,16 @@ def compose_rgb_image(
             else:
                 # Safety fallback — should never be reached with the palette logic above
                 arr = apply_level(arr, 2, 98)
+
+            # Final structure sharpening (luminance only), after all palette steps.
+            arr = apply_detail_boost(arr, DETAIL_BOOST_STRENGTH)
+            # Diagnostic only: sky/mean color per channel, so a color cast can
+            # be told apart (sky vs nebula) straight from the log.
+            emit("progress", "compose_color_stats", params={
+                "palette": palette_label,
+                "finishing_chain": "python",
+                **sky_color_stats(arr),
+            })
 
             # 8-bit output, same role as the ImageMagick path's '-depth 8':
             # see the note on that flag elsewhere in this function for why
@@ -2629,6 +2718,11 @@ def run(args) -> bool:
     cleanup_session(current_session_dir)
 
     # 1. Sort and index files by detected filter
+    emit("progress", "script_version", params={
+        "version": SCRIPT_VERSION,
+        "detail_boost": [DETAIL_BOOST_STRENGTH, DETAIL_BOOST_NOISE_K],
+        "sho_green_level_white_pct": SHO_GREEN_LEVEL_WHITE_PCT,
+    })
     emit("progress", "start", params={"target": dso_name, "message": f"Processing started for {dso_name}"})
     emit("progress", "file_analysis", params={"target": dso_name})
     debug(f"Analyzing raws for {dso_name.upper()} | Session: {current_session_dir.name}")
