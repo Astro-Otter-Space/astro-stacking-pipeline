@@ -8,9 +8,9 @@ Generates and runs Siril scripts for:
 - Clean spaces in filenames to immunize Siril parser.
 - Use native Siril 1.2+ commands ('cd', 'convert -out=.', 'stack r_light rej').
 - Properly convert FIT containers to master TIFFs (via load/save).
-- Merge channels into a chromatic composite (SHO, HOO, RGB, Mono) via ImageMagick
-  (channel combine + tone/color finishing chain only — flip, crop, synthetic
-  black channels, and star halo reduction now run on pure PIL/numpy/scipy).
+- Merge channels into a chromatic composite (SHO, HOO, RGB, LRGB, Mono) and apply
+  the tone/color finishing chain — everything runs on pure PIL/numpy/scipy/tifffile
+  (no ImageMagick dependency any more).
 - Run 100% in command-line mode (strict headless).
 
 Usage :
@@ -100,7 +100,7 @@ DETAIL_BOOST_PROTECT_GROW = 9
 
 # --- Script version (written to the log at start, see main()) ---
 # Lets a log prove WHICH script produced a render. Bump on every change.
-SCRIPT_VERSION = "2026-10-26.1"
+SCRIPT_VERSION = "2026-10-28.1"
 
 # --- SHO green level ---
 # '-level 0%,N%' on the Green channel of SHO/SHO+RGB. NOTE: N < 100 BRIGHTENS
@@ -109,6 +109,64 @@ SCRIPT_VERSION = "2026-10-26.1"
 # look validated so far; set to 100 to remove the green gain, or above 100
 # (e.g. 105) to actually reduce green.
 SHO_GREEN_LEVEL_WHITE_PCT = 95
+
+# --- SHO star green reduction ---
+# In SHO, Ha (strongest signal) is mapped to green, so stars come out
+# yellow-green (M1 log: green balance 1.42). This applies an "average
+# neutral" SCNR (G -> min(G, (R+B)/2)) ONLY on stars, so nebula colors are
+# untouched. Stars = small bright structures (white top-hat of size
+# SHO_STAR_SCNR_SIZE px above SHO_STAR_SCNR_THRESHOLD), grown and feathered.
+# SHO_STAR_SCNR_AMOUNT: 0 = off, 1 = full neutralization.
+SHO_STAR_SCNR_ENABLED = True
+SHO_STAR_SCNR_AMOUNT = 1.0
+SHO_STAR_SCNR_SIZE = 15
+SHO_STAR_SCNR_THRESHOLD = 0.30
+
+# --- Background flattening (edge glow / vignetting gradients) ---
+# Subtracts a smooth per-channel background map estimated from clean sky
+# cells (stars and bright structures excluded, narrow bumps removed by a
+# morphological opening so a galaxy halo is not mistaken for background).
+# Only applied when sky is visible across the frame (>= BG_FLATTEN_MIN_COVER of
+# the grid cells) AND the gradient is real (>= BG_FLATTEN_MIN_RANGE_255 levels),
+# so frames filled with nebulosity are left untouched. Correction is capped
+# at BG_FLATTEN_CAP (0-1 scale). Motivated by NGC 4565: blue/purple glow in the
+# corners (+15-20 levels) from 200-day-old flats. Fresh flats remain better.
+BG_FLATTEN_ENABLED = True
+BG_FLATTEN_MIN_COVER = 0.85
+BG_FLATTEN_MIN_RANGE_255 = 10
+BG_FLATTEN_CAP = 0.10
+
+# --- Highlight roll-off (RGB palette, automatic) ---
+# Soft shoulder on luminance above HIGHLIGHT_ROLLOFF_KNEE, applied BEFORE the
+# level / sigmoidal-contrast steps, which are what push a bright galaxy core
+# to flat white. Hue preserving. Self-gating: the effect is weighted by a mask
+# of EXTENDED bright areas (luminance blurred at ~8 px, 0 below 0.55 and full
+# above 0.75), so stars, faint nebulosity and the sky are not touched; only a
+# large bright core is. (A "fraction of white pixels" trigger was tried and
+# could not tell the NGC 4565 core from the Veil: 0.06 % vs 0.28 %.)
+# Truly saturated areas (brightest channel >= 0.98 BEFORE the roll-off, e.g. the core of
+# a bright star such as the Veil's principal star) are excluded: there is no
+# core detail to recover there, and compressing them turned a white star with
+# diffraction spikes into a flat grey-white disc (2026-10-27). A galaxy core is
+# not saturated at that stage (NGC 4565: p99.5 luminance 0.70).
+# Lower KNEE = stronger. Set ENABLED = False to skip.
+HIGHLIGHT_ROLLOFF_ENABLED = True
+HIGHLIGHT_ROLLOFF_KNEE = 0.50
+
+# --- Sky background neutralization ---
+# Final per-channel OFFSET so the dark sky has the same level in R, G and B.
+# Sky = darkest SKY_NEUTRALIZE_PERCENTILE % of pixels (per-channel median).
+# The lowest channel is left untouched and the others are pulled down to it,
+# so the sky is never brightened. Shift per channel is capped at
+# SKY_NEUTRALIZE_MAX_SHIFT (0-1 scale; 0.10 ~ 25/255; it was 0.04 and clipped
+# the blue of NGC 4565, which needed ~20 levels: sky R35/G33/B52 -> still purple). Real case that
+# motivated it: M42 (DSLR, no color calibration in Siril 1.2) had a sky of
+# R 22.7 / G 18.7 / B 26.2 (purple cast). It only fixes the SKY level, not
+# a tint inside the nebula midtones. Applied to every color palette (also
+# LRGB and SHA-fallback, on their 8-bit output). Set _ENABLED = False to skip.
+SKY_NEUTRALIZE_ENABLED = True
+SKY_NEUTRALIZE_PERCENTILE = 30
+SKY_NEUTRALIZE_MAX_SHIFT = 0.10
 
 # --- Flat staleness check ---
 # A master flat captured long before/after the light session may no longer
@@ -1492,7 +1550,7 @@ def run_siril_command(session_dir: Path, script_content: str, script_name: str, 
 
 
 # --------------------------------------------------------------------------
-# CHROMINANCE & COMPOSITION VIA IMAGEMAGICK
+# CHROMINANCE & COMPOSITION (numpy / tifffile)
 # --------------------------------------------------------------------------
 def crop_registration_border(image_path: Path, percent: float) -> bool:
     """
@@ -1634,6 +1692,133 @@ def reduce_star_halos(image_path: Path) -> bool:
         return False
 
 
+def sky_color_stats(arr: np.ndarray) -> dict:
+    """Sky median per channel (0-255, darkest SKY_NEUTRALIZE_PERCENTILE %
+    of pixels) + mean + green balance, for the log. arr is float 0-1, HxWx3."""
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        return {}
+    lum = arr.mean(axis=-1)
+    sky = lum <= np.percentile(lum, SKY_NEUTRALIZE_PERCENTILE)
+    med = [float(np.median(arr[..., c][sky])) * 255.0 for c in range(3)]
+    mean = arr.reshape(-1, 3).mean(axis=0) * 255.0
+    return {
+        "sky_rgb": [round(v, 1) for v in med],
+        "mean_rgb": [round(float(v), 1) for v in mean],
+        "green_balance": round(float(mean[1] / max((mean[0] + mean[2]) / 2.0, 1e-6)), 3),
+    }
+
+
+def apply_star_green_reduction(arr: np.ndarray) -> np.ndarray:
+    """Average-neutral SCNR restricted to stars (see SHO_STAR_SCNR_*)."""
+    if (not SHO_STAR_SCNR_ENABLED) or SHO_STAR_SCNR_AMOUNT <= 0 or arr.ndim != 3 or arr.shape[-1] != 3:
+        return arr
+    lum = arr.mean(axis=-1)
+    tophat = lum - ndimage.grey_opening(lum, size=SHO_STAR_SCNR_SIZE)
+    stars = (tophat > SHO_STAR_SCNR_THRESHOLD).astype(np.float64)
+    mask = np.clip(ndimage.gaussian_filter(ndimage.maximum_filter(stars, size=5), 1.5) * 1.5, 0.0, 1.0)
+    mask *= SHO_STAR_SCNR_AMOUNT
+    neutral = np.minimum(arr[..., 1], (arr[..., 0] + arr[..., 2]) / 2.0)
+    out = arr.copy()
+    out[..., 1] = arr[..., 1] * (1.0 - mask) + neutral * mask
+    return out
+
+
+def apply_sky_neutralization(arr: np.ndarray):
+    """Equalize the sky level across R, G, B (offset only, see the
+    SKY_NEUTRALIZE_* constants). arr is float 0-1, HxWx3. Returns
+    (arr, shifts_255) with shifts_255 the per-channel offsets applied on a
+    0-255 scale, or (arr, None) if skipped."""
+    if (not SKY_NEUTRALIZE_ENABLED) or arr.ndim != 3 or arr.shape[-1] != 3:
+        return arr, None
+    lum = arr.mean(axis=-1)
+    sky = lum <= np.percentile(lum, SKY_NEUTRALIZE_PERCENTILE)
+    med = np.array([np.median(arr[..., c][sky]) for c in range(3)])
+    shifts = np.clip(med - med.min(), 0.0, SKY_NEUTRALIZE_MAX_SHIFT)
+    return np.clip(arr - shifts, 0.0, 1.0), [round(float(v) * 255.0, 1) for v in shifts]
+
+
+def apply_background_flattening(arr: np.ndarray, step: int = 8, grid=(18, 24),
+                                pct: int = 40, smooth: float = 0.8):
+    """See BG_FLATTEN_*. arr float 0-1 HxWx3. Returns (arr, info dict)."""
+    info = {"applied": False}
+    if (not BG_FLATTEN_ENABLED) or arr.ndim != 3 or arr.shape[-1] != 3:
+        return arr, info
+    H, W, _ = arr.shape
+    small = ndimage.zoom(arr, (1 / step, 1 / step, 1), order=1).astype(np.float32)
+    h, w, _ = small.shape
+    lum = small.mean(-1)
+    gy, gx = grid
+    loc = ndimage.median_filter(lum, size=7)
+    res = lum - loc
+    noise = 1.4826 * np.median(np.abs(res)) + 1e-6
+    star = ndimage.maximum_filter(res > 3 * noise, size=7)
+    cells = np.full((gy, gx, 3), np.nan, np.float32)
+    good = 0
+    for i in range(gy):
+        for j in range(gx):
+            sl = (slice(i * h // gy, (i + 1) * h // gy), slice(j * w // gx, (j + 1) * w // gx))
+            l = lum[sl]
+            ok = (l <= np.percentile(l, pct)) & (~star[sl])
+            if ok.sum() >= 0.10 * l.size:
+                good += 1
+                for c in range(3):
+                    cells[i, j, c] = np.median(small[sl][..., c][ok])
+    cover = good / (gy * gx)
+    info["cover"] = round(float(cover), 2)
+    if cover < BG_FLATTEN_MIN_COVER:
+        return arr, info
+    ref = np.array([np.nanmedian(cells[..., c]) for c in range(3)], np.float32)
+    for c in range(3):
+        cells[..., c] = np.where(np.isnan(cells[..., c]), ref[c], cells[..., c])
+    # Opening removes bumps narrower than 3 cells (galaxy / nebula halo) but
+    # keeps broad edge glow, which continues past the border ('nearest').
+    cells = np.stack([ndimage.grey_opening(cells[..., c], size=(3, 3), mode="nearest") for c in range(3)], -1)
+    corr = np.stack([ndimage.gaussian_filter(cells[..., c], smooth, mode="nearest") for c in range(3)], -1) - ref
+    rng = max(float(np.percentile(corr[..., c], 98) - np.percentile(corr[..., c], 2)) for c in range(3))
+    info["range_255"] = round(rng * 255.0, 1)
+    if rng * 255.0 < BG_FLATTEN_MIN_RANGE_255:
+        return arr, info
+    corr = np.clip(corr, -BG_FLATTEN_CAP, BG_FLATTEN_CAP)
+    full = ndimage.zoom(corr, (H / gy, W / gx, 1), order=1, mode="nearest")[:H, :W].astype(np.float32)
+    info["applied"] = True
+    return np.clip(arr - full, 0.0, 1.0), info
+
+
+def apply_highlight_rolloff(arr: np.ndarray):
+    """See HIGHLIGHT_ROLLOFF_*. arr float 0-1 HxWx3. Returns (arr, info dict)."""
+    if (not HIGHLIGHT_ROLLOFF_ENABLED) or arr.ndim != 3 or arr.shape[-1] != 3:
+        return arr, {"applied": False}
+    H, W, _ = arr.shape
+    lum = arr.mean(axis=-1)
+    s = 4
+    small = ndimage.zoom(lum, 1.0 / s, order=1)
+    blur = ndimage.gaussian_filter(small, 8.0 / s)
+    ext = np.clip((blur - 0.55) / 0.20, 0.0, 1.0)
+    ext = ndimage.zoom(ext, (H / ext.shape[0], W / ext.shape[1]), order=1)[:H, :W]
+    # Saturated cores (stars) are left alone: weight -> 0 where >= 50 % of the
+    # neighbourhood (~8 px) has its brightest channel >= 0.98.
+    peak_small = ndimage.zoom(arr.max(axis=-1), 1.0 / s, order=1)
+    sat_small = ndimage.gaussian_filter((peak_small >= 0.98).astype(np.float32), 8.0 / s)
+    sat = np.clip(sat_small / 0.5, 0.0, 1.0)
+    sat = ndimage.zoom(sat, (H / sat.shape[0], W / sat.shape[1]), order=1)[:H, :W]
+    ext = ext * (1.0 - sat)
+    info = {
+        "applied": False,
+        "extended_fraction": round(float((ext > 0.5).mean()), 4),
+        "saturated_fraction": round(float((sat > 0.5).mean()), 4),
+        "p99_5_lum": round(float(np.percentile(lum, 99.5)), 3),
+    }
+    if float(ext.max()) <= 0.0:
+        return arr, info
+    k = HIGHLIGHT_ROLLOFF_KNEE
+    over = np.maximum(lum - k, 0.0)
+    lum2 = np.where(lum > k, k + (1.0 - k) * (1.0 - np.exp(-over / (1.0 - k))), lum)
+    rolled = arr * (lum2 / np.maximum(lum, 1e-6))[..., None]
+    info["applied"] = True
+    out = arr * (1.0 - ext[..., None]) + rolled * ext[..., None]
+    return np.clip(out, 0.0, 1.0), info
+
+
 LOSSY_OUTPUT_FORMATS = {"webp", "jpg", "jpeg"}
 
 
@@ -1675,7 +1860,7 @@ def compose_rgb_image(
     file_prefix: str
 ) -> bool:
     """
-    Combine normalized TIFF files into a final RGB image using ImageMagick.
+    Combine normalized TIFF files into a final RGB image (numpy/tifffile).
 
     Supported palettes (detected automatically from available channels):
       - CLEAR / L  : single broadband mono channel with full post-processing
@@ -1808,6 +1993,45 @@ def compose_rgb_image(
         combined = combined.astype(src_dtype)
 
         tifffile.imwrite(str(out_path), combined)
+        return out_path
+
+    def combine_lrgb(r_path, g_path, b_path, l_path, out_path: Path) -> Path:
+        """LRGB merge in numpy (replaces the former ImageMagick HSL combine):
+        hue and HSL saturation of the RGB image, HSL lightness replaced by the
+        luminance channel. Written as a float32 3-channel TIFF in [0, 1]."""
+        def load01(path):
+            raw = tifffile.imread(str(path))
+            if raw.ndim == 3:
+                raw = raw[..., 0]
+            return np.clip(_to_float01(raw, raw.dtype), 0.0, 1.0).astype(np.float32)
+
+        rgb = np.stack([load01(r_path), load01(g_path), load01(b_path)], axis=-1)
+        lum = load01(l_path)
+        maxc = rgb.max(axis=-1)
+        minc = rgb.min(axis=-1)
+        rng = maxc - minc
+        l0 = (maxc + minc) / 2.0
+        # HSL saturation of the RGB image
+        den = 1.0 - np.abs(2.0 * l0 - 1.0)
+        sat = np.where(rng > 1e-9, rng / np.maximum(den, 1e-9), 0.0)
+        sat = np.clip(sat, 0.0, 1.0)
+        # Hue in [0, 6)
+        r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+        safe = np.maximum(rng, 1e-9)
+        h = np.where(maxc == r, ((g - b) / safe) % 6.0,
+            np.where(maxc == g, (b - r) / safe + 2.0, (r - g) / safe + 4.0))
+        h = np.where(rng > 1e-9, h, 0.0)
+        # HSL -> RGB with the luminance channel as lightness
+        c = (1.0 - np.abs(2.0 * lum - 1.0)) * sat
+        x = c * (1.0 - np.abs(h % 2.0 - 1.0))
+        m = lum - c / 2.0
+        sector = np.floor(h).astype(np.int32) % 6
+        zero = np.zeros_like(c)
+        r1 = np.choose(sector, [c, x, zero, zero, x, c])
+        g1 = np.choose(sector, [x, c, c, x, zero, zero])
+        b1 = np.choose(sector, [zero, zero, x, c, c, x])
+        out = np.clip(np.stack([r1 + m, g1 + m, b1 + m], axis=-1), 0.0, 1.0).astype(np.float32)
+        tifffile.imwrite(str(out_path), out)
         return out_path
 
     # ------------------------------------------------------------------
@@ -1952,19 +2176,7 @@ def compose_rgb_image(
         ratio = (boosted + 1e-6) / (lum + 1e-6)
         return np.clip(arr * ratio[..., None], 0.0, 1.0)
 
-    def sky_color_stats(arr: np.ndarray) -> dict:
-        """Sky median per channel (0-255) + green balance, for the log."""
-        if arr.ndim != 3 or arr.shape[-1] != 3:
-            return {}
-        lum = arr.mean(axis=-1)
-        sky = lum <= np.percentile(lum, 30)  # darkest 30 % of pixels = sky
-        med = [float(np.median(arr[..., c][sky])) * 255.0 for c in range(3)]
-        mean = arr.reshape(-1, 3).mean(axis=0) * 255.0
-        return {
-            "sky_rgb": [round(v, 1) for v in med],
-            "mean_rgb": [round(float(v), 1) for v in mean],
-            "green_balance": round(float(mean[1] / max((mean[0] + mean[2]) / 2.0, 1e-6)), 3),
-        }
+    self_info: list = []   # (corner min, corner max, white point) per channel, for the log
 
     def apply_auto_level_region_per_channel(arr: np.ndarray, x: int, y: int, w: int, h: int) -> np.ndarray:
         """Replacement for '-region WxH+x+y -auto-level +region', using
@@ -1988,10 +2200,17 @@ def compose_rgb_image(
         for c in range(arr.shape[-1]):
             rmin = region[..., c].min()
             rmax = region[..., c].max()
-            if rmax <= rmin:
+            # The white point must never be below the image's own bright end:
+            # a sky-only corner has a low max, and using it as white clipped
+            # every brighter pixel (NGC 4565: the whole galaxy core went flat
+            # white while the input luminance was only ~0.70). So white =
+            # max(corner max, 99.95th percentile of the whole channel).
+            white = max(float(rmax), float(np.percentile(arr[..., c], 99.95)))
+            if white <= rmin:
                 out[..., c] = arr[..., c]
             else:
-                out[..., c] = np.clip((arr[..., c] - rmin) / (rmax - rmin), 0.0, 1.0)
+                out[..., c] = np.clip((arr[..., c] - rmin) / (white - rmin), 0.0, 1.0)
+            self_info.append((round(float(rmin), 3), round(float(rmax), 3), round(white, 3)))
         return out
 
     # ------------------------------------------------------------------
@@ -2036,21 +2255,14 @@ def compose_rgb_image(
     # SHO+RGB before SHO (superset), HOO before RGB (narrowband priority),
     # CLEAR before RGB fallback (explicit broadband mono handling).
     #
-    # needs_imagemagick_combine: True only for the two branches NOT ported
-    # to combine_channels() — LRGB (custom HSL-based combine, flagged
-    # high-risk, deliberately left untouched) and the SHA no-RGB fallback
-    # (its blue-channel synthesis uses -level/-modulate, not yet ported).
-    # Every other palette now merges its channels in Python beforehand, so
-    # cmd starts from a single already-combined TIFF instead of raw
-    # per-channel files + inline blend sub-expressions.
-    # ------------------------------------------------------------------
-    needs_imagemagick_combine = False
+    # Every palette is merged in Python (combine_channels / combine_lrgb).
+    _sha_blue_path = {"path": None}
     combined_path = session_dir / f".combined_{file_prefix}.tif"
 
     # NOTE on error handling: combine_channels() below does real file I/O
     # (tifffile read/write), same as chan()'s Image.new().save() already
     # did before this change — neither is wrapped in a try/except at this
-    # level (only the final subprocess.run(), further down, is). A failure
+    # level (only the finishing chain below is). A failure
     # here (missing/corrupt channel file) propagates uncaught out of
     # compose_rgb_image, same as it already did for chan() — caught by the
     # top-level try/except in `if __name__ == "__main__":`, which exits(1)
@@ -2102,23 +2314,19 @@ def compose_rgb_image(
             debug("  SHA: using broadband BLUE channel")
             combine_channels(chan("SII"), chan("HA"), chan("BLUE"), combined_path)
         else:
-            # Fallback: darken HA via gamma boost to simulate a blue-shifted channel.
-            # -level 0%,100%,1.5 raises midtones; -modulate 60 reduces overall brightness.
-            # NOT ported to combine_channels(): this synthesizes the blue slot
-            # via -level/-modulate first, which is a separate, not-yet-ported
-            # risk tier (see compose_rgb_image's module notes) — only the
-            # plain-channel-merge case above was in scope for this pass.
+            # Fallback: synthesize a blue slot from HA (gamma 1.5 to raise the
+            # midtones, then x0.6 brightness) to simulate a blue-shifted channel.
             debug("  SHA fallback: gamma-darkened HA as synthetic blue channel")
-            needs_imagemagick_combine = True
-            cmd = [
-                "convert",
-                chan("SII"),
-                chan("HA"),
-                "(", chan("HA"),
-                    "-level", "0%,100%,1.5",
-                    "-modulate", "60",
-                ")",
-            ]
+            ha_raw = tifffile.imread(chan("HA"))
+            ha01 = _to_float01(ha_raw, ha_raw.dtype)
+            blue01 = np.clip(ha01, 0.0, 1.0) ** (1.0 / 1.5) * 0.6
+            if np.issubdtype(ha_raw.dtype, np.integer):
+                blue_raw = np.round(blue01 * np.iinfo(ha_raw.dtype).max).astype(ha_raw.dtype)
+            else:
+                blue_raw = blue01.astype(ha_raw.dtype)
+            _sha_blue_path["path"] = session_dir / f".sha_blue_{file_prefix}.tif"
+            tifffile.imwrite(str(_sha_blue_path["path"]), blue_raw)
+            combine_channels(chan("SII"), chan("HA"), _sha_blue_path["path"], combined_path)
         palette_label = "SHA"
 
     # HaRGB : HA-enriched red channel blended with broadband RGB.
@@ -2136,33 +2344,9 @@ def compose_rgb_image(
 
     elif has_clear and has_rgb:
         debug(f"Palette: LRGB (key={clear_key})")
-        needs_imagemagick_combine = True  # untouched — own inline HSL combine, see note below
-        cmd = ["convert",
-            # Extract Hue channel from the RGB base
-            "(",
-                "(", chan("RED"), chan("GREEN"), chan("BLUE"),
-                    "-combine", "-colorspace", "sRGB",
-                ")",
-                "-colorspace", "HSL",
-                "-channel", "R", "-separate", "+channel",
-            ")",
-            # Extract Saturation channel from the RGB base
-            "(",
-                "(", chan("RED"), chan("GREEN"), chan("BLUE"),
-                    "-combine", "-colorspace", "sRGB",
-                ")",
-                "-colorspace", "HSL",
-                "-channel", "G", "-separate", "+channel",
-            ")",
-            # Dedicated Luminance channel
-            str(tif_files[clear_key]),
-            # CRITICAL: -set colorspace HSL DECLARES the colorspace without converting.
-            # Using -colorspace HSL here would CONVERT [H,S,L] data as if it were sRGB
-            # → completely wrong color mapping → the red/noisy catastrophe observed.
-            "-combine",
-            "-set", "colorspace", "HSL",    # ← déclaration, PAS conversion
-            "-colorspace", "sRGB",           # ← conversion HSL→sRGB
-        ]
+        # LRGB: hue and saturation come from the RGB image, lightness from the
+        # dedicated luminance channel (HSL replacement), done in numpy.
+        combine_lrgb(chan("RED"), chan("GREEN"), chan("BLUE"), tif_files[clear_key], combined_path)
         palette_label = "LRGB"
 
     # CLEAR / L / LUMINANCE : broadband mono channel.
@@ -2224,197 +2408,143 @@ def compose_rgb_image(
     #     Lighter sharpening than RGB to avoid amplifying mono noise.
     # ------------------------------------------------------------------
 
-    # Only LRGB and the SHA no-RGB fallback still need ImageMagick at all:
-    # both build their merged image via inline ImageMagick expressions
-    # (LRGB's custom HSL combine; SHA-fallback's -level/-modulate synthetic
-    # blue channel) — see the notes on needs_imagemagick_combine above.
-    # Deliberately left untouched (🔴 high-risk / out of scope), so their
-    # combine AND finishing chain both stay a single ImageMagick call.
-    #
-    # Every other palette (SHO, SHO+RGB, HOO, SHA-with-RGB, HaRGB, RGB,
-    # CLEAR) is now fully ported: the merge already happened in Python via
-    # combine_channels() above, and the finishing chain below (-level,
-    # -sigmoidal-contrast, -modulate, -unsharp, -region/-auto-level) runs
-    # on the same array in numpy/scipy — no ImageMagick call for these at
-    # all. Every formula was empirically verified against real `convert`
-    # round-trips before being ported (see the primitives defined near
-    # combine_channels() above for verification notes on each one).
-    if needs_imagemagick_combine:
-        # --- LRGB / SHA-fallback: unchanged ImageMagick path ---
-        cmd.extend([
-            "-combine",
-            "-colorspace", "sRGB",
-        ])
+    # Every palette (SHO, SHO+RGB, HOO, SHA, HaRGB, LRGB, RGB, CLEAR) is merged
+    # in Python above (combine_channels / combine_lrgb) and finished below in
+    # numpy/scipy. ImageMagick is no longer used anywhere in this script.
+    # --- Everyone else: pure Python finishing chain, no ImageMagick ---
+    source_path = str(tif_files[clear_key]) if palette_label == "CLEAR" else str(combined_path)
+    emit("progress", "finishing_started", params={"palette": palette_label})
+    try:
+        raw = tifffile.imread(source_path)
+        arr = _to_float01(raw, raw.dtype)
 
-        if palette_label == "SHA":
-            cmd.extend([
-                "-level", "0.5%,99.5%",
-                "-sigmoidal-contrast", "3x45%",
-                "-modulate", "100,115",
-                "-unsharp", "0.5x1.0+0.5+0.01",
-            ])
+        _hl_info = None
+        if palette_label in ("SHO", "SHO+RGB"):
+            arr = apply_level(arr, 0.5, 99.5)
+            arr = apply_sigmoidal_contrast(arr, 3, 45)
+            arr = apply_modulate_saturation(arr, 135)
+            arr = apply_unsharp(arr, 1.0, 0.5, 0.01)
+            # Green level (see SHO_GREEN_LEVEL_WHITE_PCT): with the
+            # default 95 this is a +5.3 % green GAIN, not a reduction.
+            arr = apply_channel_level(arr, 1, 0, SHO_GREEN_LEVEL_WHITE_PCT)  # channel 1 = Green
+            arr = apply_star_green_reduction(arr)
+
+        elif palette_label == "HOO":
+            arr = apply_level(arr, 0.5, 99.5)
+            arr = apply_sigmoidal_contrast(arr, 4, 45)
+            arr = apply_modulate_saturation(arr, 145)
+            arr = apply_unsharp(arr, 1.0, 0.5, 0.01)
+
+        elif palette_label == "SHA":
+            arr = apply_level(arr, 0.5, 99.5)
+            arr = apply_sigmoidal_contrast(arr, 3, 45)
+            arr = apply_modulate_saturation(arr, 115)
+            arr = apply_unsharp(arr, 1.0, 0.5, 0.01)
+
+        elif palette_label == "HaRGB":
+            arr = apply_level(arr, 1, 99)
+            arr = apply_sigmoidal_contrast(arr, 3, 45)
+            arr = apply_modulate_saturation(arr, 110)
+            arr = apply_unsharp(arr, 1.0, 0.6, 0.02)
+
+        elif palette_label == "RGB":
+            arr, _hl_info = apply_highlight_rolloff(arr)
+            arr = apply_level(arr, 1, 98)
+            arr = apply_sigmoidal_contrast(arr, 4, 50)
+            arr = apply_unsharp(arr, 1.2, 0.8, 0.05)
+            # OSC background neutralization (approximate cc -nostellar
+            # equivalent). Sample the corner (sky background, 100x100 at
+            # 0,0) and normalize EACH CHANNEL INDEPENDENTLY to correct
+            # the RGGB Bayer red-channel dominance on emission nebulae.
+            #
+            # This replaces the old '-region 100x100+0+0 -auto-level
+            # +region' call. That ImageMagick call did NOT actually do
+            # this: without an explicit '-channel RGB', -auto-level runs
+            # in "Sync" mode (verified via real convert round-trips) —
+            # it computes ONE combined min/max across all 3 channels and
+            # applies an identical stretch to each, which does not
+            # correct color dominance at all, despite what this code's
+            # old comment claimed. Per explicit decision, this Python
+            # port implements the originally-intended per-channel
+            # correction instead of faithfully reproducing that
+            # non-functional Sync-mode behavior.
+            arr = apply_auto_level_region_per_channel(arr, 0, 0, 100, 100)
+
         elif palette_label == "LRGB":
-            cmd.extend([
-                "-level", "1%,99%",
-                "-sigmoidal-contrast", "3x50%",
-                "-modulate", "100,110",           # slight chrominance saturation boost
-                "-unsharp", "0x1.0+0.6+0.02",
-            ])
+            arr = apply_level(arr, 1, 99)
+            arr = apply_sigmoidal_contrast(arr, 3, 50)
+            arr = apply_modulate_saturation(arr, 110)
+            arr = apply_unsharp(arr, 1.0, 0.6, 0.02)
+
+        elif palette_label == "CLEAR":
+            arr = apply_level(arr, 1, 99)
+            arr = apply_sigmoidal_contrast(arr, 3, 48)
+            arr = apply_unsharp(arr, 1.0, 0.5, 0.02)
+
         else:
             # Safety fallback — should never be reached with the palette logic above
-            cmd.extend(["-level", "2%,98%"])
+            arr = apply_level(arr, 2, 98)
 
-        # -depth 8: force an explicit output bit depth on the final write.
-        # Without this, a 32-bit-float source (the default, output_bits=32)
-        # makes ImageMagick write a 32-bit-unsigned-int TIFF that Pillow's
-        # TIFF codec can't open at all, breaking reduce_star_halos() /
-        # correct_image_orientation() downstream.
-        cmd.extend(["-depth", "8"])
-
-        # No -quality flag here: output_file is always the lossless work_path
-        # now (see get_composition_paths) — the one-time lossy encode, if
-        # the user requested webp/jpg, happens later in
-        # correct_image_orientation, the pipeline's last step.
-        cmd.append(str(output_file))
-
-        debug(f"ImageMagick [{palette_label}]: {' '.join(str(c) for c in cmd)}")
-
-        emit("progress", "imagemagick_started", params={"palette": palette_label})
-
-        try:
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            if result.returncode != 0:
-                debug(f"ImageMagick STDERR: {result.stderr}")
-            success = result.returncode == 0
-            emit("progress", "imagemagick_done", params={"palette": palette_label, "success": success})
-            if success:
-                reduce_star_halos(output_file)
-            emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": success})
-            return success
-        except Exception as e:
-            debug(f"ImageMagick composite assembly failure: {e}")
-            emit("progress", "imagemagick_done", params={      "palette": palette_label, "success": False, "error": str(e)})
-            emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": False, "error": str(e)})
-            return False
-        finally:
-            if _synthetic_black_path["path"] and _synthetic_black_path["path"] != "xc:black":
-                try:
-                    Path(_synthetic_black_path["path"]).unlink(missing_ok=True)
-                except Exception as e:
-                    debug(f"Failed to remove synthetic black channel file: {e}")
-
-    else:
-        # --- Everyone else: pure Python finishing chain, no ImageMagick ---
-        source_path = str(tif_files[clear_key]) if palette_label == "CLEAR" else str(combined_path)
-        emit("progress", "imagemagick_started", params={"palette": palette_label})
-        try:
-            raw = tifffile.imread(source_path)
-            arr = _to_float01(raw, raw.dtype)
-
-            if palette_label in ("SHO", "SHO+RGB"):
-                arr = apply_level(arr, 0.5, 99.5)
-                arr = apply_sigmoidal_contrast(arr, 3, 45)
-                arr = apply_modulate_saturation(arr, 135)
-                arr = apply_unsharp(arr, 1.0, 0.5, 0.01)
-                # Green level (see SHO_GREEN_LEVEL_WHITE_PCT): with the
-                # default 95 this is a +5.3 % green GAIN, not a reduction.
-                arr = apply_channel_level(arr, 1, 0, SHO_GREEN_LEVEL_WHITE_PCT)  # channel 1 = Green
-
-            elif palette_label == "HOO":
-                arr = apply_level(arr, 0.5, 99.5)
-                arr = apply_sigmoidal_contrast(arr, 4, 45)
-                arr = apply_modulate_saturation(arr, 145)
-                arr = apply_unsharp(arr, 1.0, 0.5, 0.01)
-
-            elif palette_label == "SHA":
-                arr = apply_level(arr, 0.5, 99.5)
-                arr = apply_sigmoidal_contrast(arr, 3, 45)
-                arr = apply_modulate_saturation(arr, 115)
-                arr = apply_unsharp(arr, 1.0, 0.5, 0.01)
-
-            elif palette_label == "HaRGB":
-                arr = apply_level(arr, 1, 99)
-                arr = apply_sigmoidal_contrast(arr, 3, 45)
-                arr = apply_modulate_saturation(arr, 110)
-                arr = apply_unsharp(arr, 1.0, 0.6, 0.02)
-
-            elif palette_label == "RGB":
-                arr = apply_level(arr, 1, 98)
-                arr = apply_sigmoidal_contrast(arr, 4, 50)
-                arr = apply_unsharp(arr, 1.2, 0.8, 0.05)
-                # OSC background neutralization (approximate cc -nostellar
-                # equivalent). Sample the corner (sky background, 100x100 at
-                # 0,0) and normalize EACH CHANNEL INDEPENDENTLY to correct
-                # the RGGB Bayer red-channel dominance on emission nebulae.
-                #
-                # This replaces the old '-region 100x100+0+0 -auto-level
-                # +region' call. That ImageMagick call did NOT actually do
-                # this: without an explicit '-channel RGB', -auto-level runs
-                # in "Sync" mode (verified via real convert round-trips) —
-                # it computes ONE combined min/max across all 3 channels and
-                # applies an identical stretch to each, which does not
-                # correct color dominance at all, despite what this code's
-                # old comment claimed. Per explicit decision, this Python
-                # port implements the originally-intended per-channel
-                # correction instead of faithfully reproducing that
-                # non-functional Sync-mode behavior.
-                arr = apply_auto_level_region_per_channel(arr, 0, 0, 100, 100)
-
-            elif palette_label == "CLEAR":
-                arr = apply_level(arr, 1, 99)
-                arr = apply_sigmoidal_contrast(arr, 3, 48)
-                arr = apply_unsharp(arr, 1.0, 0.5, 0.02)
-
-            else:
-                # Safety fallback — should never be reached with the palette logic above
-                arr = apply_level(arr, 2, 98)
-
-            # Final structure sharpening (luminance only), after all palette steps.
+        # Sky neutralization (offset), then final structure sharpening
+        # (luminance only), after all palette steps.
+        # LRGB keeps its previous finishing (sky neutralization only): M20 was
+        # validated that way. Remove the condition to give it the same
+        # flattening + detail boost as the other palettes.
+        if palette_label == "LRGB":
+            _bg_info = {"applied": False, "reason": "lrgb_parity"}
+            arr, _sky_shifts = apply_sky_neutralization(arr)
+        else:
+            arr, _bg_info = apply_background_flattening(arr)
+            arr, _sky_shifts = apply_sky_neutralization(arr)
             arr = apply_detail_boost(arr, DETAIL_BOOST_STRENGTH)
-            # Diagnostic only: sky/mean color per channel, so a color cast can
-            # be told apart (sky vs nebula) straight from the log.
-            emit("progress", "compose_color_stats", params={
-                "palette": palette_label,
-                "finishing_chain": "python",
-                **sky_color_stats(arr),
-            })
+        # Sky/mean color per channel in the log, so a color cast can be
+        # told apart (sky vs nebula) straight from the log.
+        emit("progress", "compose_color_stats", params={
+            "palette": palette_label,
+            "finishing_chain": "python",
+            "sky_shift_255": _sky_shifts,
+            "bg_flatten": _bg_info,
+            "highlight_rolloff": _hl_info,
+            "auto_level_region": list(self_info) or None,
+            **sky_color_stats(arr),
+        })
 
-            # 8-bit output, same role as the ImageMagick path's '-depth 8':
-            # see the note on that flag elsewhere in this function for why
-            # an explicit 8-bit write matters for the downstream PIL steps.
-            out8 = _from_float01_to_uint8(arr)
-            tifffile.imwrite(str(output_file), out8)
-            success = True
+        # 8-bit output, same role as the ImageMagick path's '-depth 8':
+        # see the note on that flag elsewhere in this function for why
+        # an explicit 8-bit write matters for the downstream PIL steps.
+        out8 = _from_float01_to_uint8(arr)
+        tifffile.imwrite(str(output_file), out8)
+        success = True
 
-            emit("progress", "imagemagick_done", params={"palette": palette_label, "success": success})
-            reduce_star_halos(output_file)
-            emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": success})
-            return success
-        except Exception as e:
-            debug(f"Python finishing-chain failure [{palette_label}]: {e}")
-            emit("progress", "imagemagick_done", params={      "palette": palette_label, "success": False, "error": str(e)})
-            emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": False, "error": str(e)})
-            return False
-        finally:
-            if _synthetic_black_path["path"] and _synthetic_black_path["path"] != "xc:black":
-                try:
-                    Path(_synthetic_black_path["path"]).unlink(missing_ok=True)
-                except Exception as e:
-                    debug(f"Failed to remove synthetic black channel file: {e}")
-            if palette_label != "CLEAR":
-                try:
-                    combined_path.unlink(missing_ok=True)
-                except Exception as e:
-                    debug(f"Failed to remove combined-channels temp file: {e}")
+        emit("progress", "finishing_done", params={"palette": palette_label, "success": success})
+        reduce_star_halos(output_file)
+        emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": success})
+        return success
+    except Exception as e:
+        debug(f"Python finishing-chain failure [{palette_label}]: {e}")
+        emit("progress", "finishing_done", params={      "palette": palette_label, "success": False, "error": str(e)})
+        emit("progress", "compose_rgb_image_done", params={"palette": palette_label, "success": False, "error": str(e)})
+        return False
+    finally:
+        if _synthetic_black_path["path"] and _synthetic_black_path["path"] != "xc:black":
+            try:
+                Path(_synthetic_black_path["path"]).unlink(missing_ok=True)
+            except Exception as e:
+                debug(f"Failed to remove synthetic black channel file: {e}")
+        if _sha_blue_path["path"]:
+            try:
+                Path(_sha_blue_path["path"]).unlink(missing_ok=True)
+            except Exception as e:
+                debug(f"Failed to remove SHA synthetic blue file: {e}")
+        if palette_label != "CLEAR":
+            try:
+                combined_path.unlink(missing_ok=True)
+            except Exception as e:
+                debug(f"Failed to remove combined-channels temp file: {e}")
 
 
 def get_image_dimensions(ref_path: Path) -> tuple:
-    """Get real dimensions of the master FITS for ImageMagick."""
+    """Get real dimensions of the master FITS."""
     try:
         with Image.open(ref_path) as img:
             return img.size # Returns (width, height)
@@ -2637,6 +2767,26 @@ def align_images_with_astroalign(session_dir, filter_name, reference_path):
 # --------------------------------------------------------------------------
 # COORDINATION AND MAIN RUNNER
 # --------------------------------------------------------------------------
+def remove_master_fits(master_files_map: dict) -> None:
+    """Delete the per-filter master .fit files ({prefix}_{filter}.fit and their
+    *_aligned.fit counterparts) once the composition is done. They are only
+    intermediates: the pipeline's deliverable is the final image."""
+    seen = set()
+    for fit_path in master_files_map.values():
+        fit_path = Path(fit_path)
+        stem = fit_path.stem[:-len("_aligned")] if fit_path.stem.endswith("_aligned") else fit_path.stem
+        for candidate in (fit_path.with_name(f"{stem}.fit"), fit_path.with_name(f"{stem}_aligned.fit")):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                if candidate.is_file():
+                    candidate.unlink()
+                    debug(f"Master FITS deleted: {candidate}")
+            except Exception as e:
+                debug(f"Failed to delete master FITS {candidate}: {e}")
+
+
 def cleanup_session(session_dir: Path):
     """Clean all temporary files, including converted masters and gradient residuals."""
 
@@ -2722,6 +2872,10 @@ def run(args) -> bool:
         "version": SCRIPT_VERSION,
         "detail_boost": [DETAIL_BOOST_STRENGTH, DETAIL_BOOST_NOISE_K],
         "sho_green_level_white_pct": SHO_GREEN_LEVEL_WHITE_PCT,
+        "sky_neutralize": [SKY_NEUTRALIZE_ENABLED, SKY_NEUTRALIZE_MAX_SHIFT],
+        "sho_star_scnr": [SHO_STAR_SCNR_ENABLED, SHO_STAR_SCNR_AMOUNT],
+        "bg_flatten": [BG_FLATTEN_ENABLED, BG_FLATTEN_MIN_RANGE_255],
+        "highlight_rolloff": [HIGHLIGHT_ROLLOFF_ENABLED, HIGHLIGHT_ROLLOFF_KNEE],
     })
     emit("progress", "start", params={"target": dso_name, "message": f"Processing started for {dso_name}"})
     emit("progress", "file_analysis", params={"target": dso_name})
@@ -2996,10 +3150,11 @@ def run(args) -> bool:
     if not tif_mapped_files:
         debug("Critical failure collecting intermediate TIFF matrices.")
         emit("error", "tiff_mapping_failed", params={"detail": "No TIFF files found after extraction"})
+        remove_master_fits(master_files_map)
         emit("done", params={"uuid": session_uuid, "output_format": format_requested})
         return False
 
-    # 7. Final composition via ImageMagick
+    # 7. Final composition (numpy / tifffile)
     emit("progress", "composition_started", params={"format": format_requested, "channels": list(tif_mapped_files.keys())})
     composite_success = compose_rgb_image(current_session_dir, tif_mapped_files, format_requested, file_prefix)
 
@@ -3008,6 +3163,7 @@ def run(args) -> bool:
         cleanup_session(current_session_dir)
     except Exception as e:
         debug(f"Final clean-up failed : {e}")
+    remove_master_fits(master_files_map)
 
     if composite_success:
         work_image, final_image = get_composition_paths(current_session_dir, file_prefix, format_requested)
@@ -3015,7 +3171,7 @@ def run(args) -> bool:
             emit("progress", "orientation_correction", params={"file": work_image.name})
             last_stacked = next(iter(master_files_map.values()), None)
             correct_image_orientation(work_image, fits_source_path=last_stacked, final_path=final_image)
-
+            # correct_image_orientation(work_image, final_path=final_image)
             end = datetime.now()
             elapsed = end - start
             emit("done", "composition_done", params={
