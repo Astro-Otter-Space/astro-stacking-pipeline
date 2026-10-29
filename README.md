@@ -1,6 +1,6 @@
 # Astro-Otter: Automated Astrophotography Stacking Script
 
-A Python script designed for automated deep-sky image stacking and processing. It orchestrates Siril for calibration and stacking, then uses ImageMagick for final composition, creating a streamlined workflow for both EAA (Electronically Assisted Astronomy) and SaaS (Service as a Service) high-availability scenarios.
+A Python script designed for automated deep-sky image stacking and processing. It orchestrates Siril for calibration and stacking, then composes and finishes the final image in pure Python (numpy, scipy, tifffile, Pillow), creating a streamlined workflow for both EAA (Electronically Assisted Astronomy) and SaaS (Software as a Service) high-availability scenarios.
 
 ## Information
 This script is currently in development and is not yet ready for production use. If you see any issues or have suggestions, please report them on the [GitHub repository](https://github.com/Astro-Otter-Space/astro-stacking-pipeline/issues).
@@ -8,36 +8,45 @@ This script is currently in development and is not yet ready for production use.
 ## Features
 
 *   **Automatic Sensor Detection**: Identifies if your camera is Mono or OSC (One-Shot-Color) by reading FITS header keywords (e.g., `BAYERPAT`, `INSTRUME`).
-*   **Smart Filter Sorting**: Automatically categorizes light frames into filters (HA, OIII, SII, RED, GREEN, BLUE, etc.) using FITS header data (`FILTER`, `IMAGETYP`) or filename patterns.
-*   **Master Calibration**: Automatically locates and applies master darks, flats, and bias frames for calibration.
+*   **Smart Filter Sorting**: Automatically categorizes light frames into filters (HA, OIII, SII, RED, GREEN, BLUE, LUMINANCE, etc.) using FITS header data (`FILTER`, `IMAGETYP`) or filename patterns.
+*   **Master Calibration**: Automatically locates and applies master darks, flats, and bias frames for calibration, and warns when a master flat is much older than the lights (`flat_staleness_warning`).
 *   **Robust File Handling**: Normalizes master calibration files (ensures 2D FITS format) and cleans spaces from filenames to prevent Siril parsing errors.
 *   **Adaptive Processing**: Adjusts Siril's `subsky` parameters based on the availability of calibration frames (e.g., uses higher tolerance if no flat is available).
-*   **Flexible Output**: Supports multiple output formats (PNG, JPG, TIFF, WEBP).
+*   **Flexible Output**: Supports multiple output formats (PNG, JPG, TIFF, WEBP). Lossy formats are encoded only once, at the very end.
 *   **Cross-Filter Alignment**: Performs a final geometric alignment between stacked filter channels for precise registration.
-*   **Advanced Compositing**: Creates final color images using various palettes:
-    *   **Hubble Palette (SHO)**: SII (Red), Ha (Green), OIII (Blue).
-    *   **HOO Palette**: Ha (Red), OIII (Green), OIII (Blue).
-    *   **RGB**: Standard color imaging.
-    *   **HOO+RGB Hybrid**: Blends narrowband data (Ha, OIII) with RGB for vibrant stars and nebulosity.
-*   **Headless Operation**: Designed to run entirely from the command line, perfect for automated pipelines.
+*   **Advanced Compositing**: Creates final color images using palettes detected automatically from the available channels:
+    *   **SHO (Hubble)**: SII (Red), Ha (Green), OIII (Blue).
+    *   **SHO+RGB**: SHO blended (80/20) with broadband RGB for natural star colors.
+    *   **HOO**: Ha (Red), 30 % Ha + 70 % OIII (Green), OIII (Blue).
+    *   **SHA**: SII (Red), Ha (Green), broadband Blue (or a synthetic blue derived from Ha when no RGB is available).
+    *   **HaRGB**: Ha-enriched red (60 % Ha + 40 % Red) with broadband Green and Blue.
+    *   **LRGB**: hue and saturation from RGB, lightness from the luminance channel.
+    *   **RGB**: Standard color imaging (mono camera with filters, or OSC).
+    *   **CLEAR / L**: single broadband channel (typically an OSC camera), with the full finishing chain.
+*   **Pure-Python Finishing Chain**: per-palette levels, sigmoidal contrast, saturation and unsharp mask, followed by automatic corrections applied when relevant:
+    *   background flattening (removes a smooth residual gradient or edge glow measured on clean sky),
+    *   sky neutralization (per-channel offset so the background is neutral grey),
+    *   highlight roll-off on large bright cores (galaxy nuclei, bright nebula centers) without touching saturated stars,
+    *   star-only green reduction on SHO palettes,
+    *   noise-cored detail boost on luminance, and star halo reduction.
+    The tuning constants live at the top of `stacking.py`; there are no extra command-line parameters.
+*   **Headless Operation**: Designed to run entirely from the command line, perfect for automated pipelines. Progress is reported as one JSON event per line.
 
 ## Prerequisites
 
 Before using this script, ensure the following software is installed on your system:
 
-1.  **Python 3.8 or higher**: The script is written in Python.
-2.  **Siril 1.2.0 or higher**: The core image processing engine. The `siril-cli` command must be available in your system's PATH.
+1.  **Python 3.9 or higher**: The script is written in Python.
+2.  **Siril 1.2.0 or higher**: The core calibration and stacking engine. The `siril-cli` command must be available in your system's PATH.
     *   Installation (Ubuntu/Debian): `sudo apt install siril`
     *   Installation (macOS with Homebrew): `brew install siril`
     *   Windows: Download from the [official Siril website](https://www.siril.org/).
-3.  **ImageMagick**: Used for the final image composition and format conversion.
-    *   Installation (Ubuntu/Debian): `sudo apt install imagemagick`
-    *   Installation (macOS with Homebrew): `brew install imagemagick`
-    *   Windows: Download from the [ImageMagick website](https://imagemagick.org/).
-4.  **Python Packages**: Install the required Python dependencies using pip:
+3.  **Python Packages**: `numpy`, `scipy`, `tifffile`, `Pillow` and `astropy`. Install them with pip:
     ```bash
     pip install -r requirements.txt
     ```
+
+No other system dependency is required: image composition and finishing no longer rely on ImageMagick.
 
 ## Installation
 
@@ -55,14 +64,13 @@ Before using this script, ensure the following software is installed on your sys
     ```bash
     pip install -r requirements.txt
     ```
-4.  Ensure `siril-cli` and `convert` (from ImageMagick) are accessible from your command line.
+4.  Ensure `siril-cli` is accessible from your command line.
 
 
 ## Usage
 
 The script is executed from the command line.
-```
-bash
+```bash
 python3 stacking.py <uuid> [OPTIONS]
 ```
 ### Arguments
@@ -79,17 +87,16 @@ python3 stacking.py <uuid> [OPTIONS]
 
 The script expects a specific directory layout relative to its location:
 ```
-venv/                    # Python libraries           
+venv/                    # Python libraries
 sessions/
     └── <uuid>/
-        ├── lights/          # Raw light frames (.fit, .fits, .fts)
+        ├── lights/          # Raw light frames (.fit, .fits, .fts, or camera RAW)
         ├── darks/           # Master darks and dark frames (optional)
         ├── flats/           # Master flats and flat frames (optional)
         └── bias/            # Master bias/offset frames (optional)
 ```
 ### Example Commands
-```
-bash
+```bash
 # Basic usage, outputs PNG
 python3 stacking.py my_session_001 --dso=M42
 
@@ -101,10 +108,12 @@ python3 stacking.py debug_session --dso=m42 --verbose
 ```
 ## Output
 
-The script will create the following files in the `sessions/<uuid>/` directory:
-*   `stacked_<FILTER>.fit`: Intermediate stacked FITS files for each filter.
-*   `stacked_<FILTER>.tif`: Linear TIFF files converted from the stacked FITS.
-*   `<dso>_<timestamp>_full.<format>`: The final composed output image.
+The deliverable is a single file in the `sessions/<uuid>/` directory:
+*   `<dso>_<timestamp>_full.<format>`: The final composed image.
+
+Intermediate files (per-filter stacked and aligned FITS, linear TIFFs, temporary Siril scripts and working directories) are deleted once the composition is done.
+
+While it runs, the script prints progress events as JSON lines (`start`, `stacking_started`, `combine`, `finishing_started`, `finishing_done`, `compose_color_stats`, `composition_done`, ...). `compose_color_stats` reports the sky and mean colors and the corrections applied, which helps diagnosing a color cast straight from the log.
 
 ## How It Works
 
@@ -116,11 +125,12 @@ The script will create the following files in the `sessions/<uuid>/` directory:
     *   Apply calibration (if masters are found).
     *   Register (align) and stack the frames.
     *   Perform background extraction (`subsky`).
-    *   Save the result as a FITS file.
+    *   Stretch the result and save it as a FITS file.
 5.  **Cross-Filter Alignment**: If multiple filters are stacked, the script aligns the master frames against a reference (e.g., Ha) to ensure perfect registration.
 6.  **TIFF Conversion**: The final stacked FITS files are converted to linear TIFFs using Siril.
-7.  **Final Composition**: ImageMagick combines the TIFFs into the final color image using the appropriate palette.
-8.  **Cleanup**: Temporary files and working directories are removed.
+7.  **Final Composition**: The TIFFs are merged into the final color image with the appropriate palette and finished (contrast, saturation, sharpening, background and sky corrections), all in Python with numpy, scipy and tifffile.
+8.  **Orientation & Encoding**: The image is flipped to the conventional top-left origin and written once in the requested format.
+9.  **Cleanup**: Temporary files, intermediate FITS and TIFFs, and working directories are removed.
 
 ## License
 
