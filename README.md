@@ -132,6 +132,31 @@ While it runs, the script prints progress events as JSON lines (`start`, `stacki
 8.  **Orientation & Encoding**: The image is flipped to the conventional top-left origin and written once in the requested format.
 9.  **Cleanup**: Temporary files, intermediate FITS and TIFFs, and working directories are removed.
 
+## Tests
+
+The pipeline has been run on the following datasets (17 test runs in total). The table shows which filters were present for each deep-sky object and which palette was selected automatically.
+
+| DSO (log target) | HA | OIII | SII | RED | GREEN | BLUE | LUMINANCE / L | CLEAR | Palette |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|---|
+| **M1** (Crab Nebula) | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | SHO |
+| **M16** (Eagle Nebula) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ (`L`) | ❌ | CLEAR |
+| **M20** (Trifid Nebula) | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | LRGB |
+| **M42** (Orion Nebula) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | CLEAR |
+| **NGC 4565** (Needle Galaxy) | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | RGB |
+| **NGC 6930** (Veil Nebula session) | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | RGB |
+
+Notes:
+
+*   **M16**: the detected filter is `L`, handled as `CLEAR` because the camera is a color sensor (OSC, detected from the Bayer pattern).
+*   **M42**: `CLEAR` filter with a RAW camera (`.NEF` files), hence also OSC.
+*   **M1, M20, NGC 4565, NGC 6930**: monochrome cameras with a filter wheel.
+*   **NGC 6930**: the target name in the log is `ngc6930`, while the session is named `veil_nebula` and the source files are tagged `NGC 6960`.
+
+### Palettes not covered yet
+
+HOO, SHO+RGB, SHA (including the fallback path with SII + Ha and no RGB, only verified on synthetic data) and HaRGB do not appear in any test run yet. Datasets exercising them are welcome.
+
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
